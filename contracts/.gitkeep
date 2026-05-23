@@ -1,0 +1,3 @@
+# Placeholder. In step 2 we vendor v4-core and v4-periphery as submodules:
+#   git submodule add https://github.com/Uniswap/v4-core
+#   git submodule add https://github.com/Uniswap/v4-periphery

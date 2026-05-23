@@ -1,0 +1,49 @@
+# ETH / USDC 5bps default config.
+# Knobs here override harness defaults; missing knobs fall through to code.
+
+pool:
+  # Uniswap V3 ETH/USDC 5bps on mainnet — used as the swap source.
+  v3_address: "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"
+  token0:
+    symbol: USDC
+    decimals: 6
+  token1:
+    symbol: WETH
+    decimals: 18
+  # Fee tier the v4 pool under test will use (1e6 = 100%, so 500 = 5bps).
+  v4_fee: 500
+  v4_tick_spacing: 10
+
+data:
+  subgraph_id: "5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV"
+  # 1 year ending most-recent-full-month, set by --days at the CLI.
+  days: 365
+  cache_path: "data/cache/swaps_88e6a0c2.parquet"
+
+lp:
+  notional_usd: 1_000_000
+  initial_split: [0.5, 0.5]
+
+worlds:
+  - name: vanilla_full_range
+    type: full_range
+  - name: vanilla_concentrated_10
+    type: concentrated
+    bandwidth_pct: 10
+  - name: hook_under_test
+    type: hook
+    # filled in once a hook is wired up
+    hook_address: null
+    adapter: null
+
+gas:
+  fixed_gwei: 10
+
+arb:
+  # Perfect arb: zero gas, zero spread, snaps √P to v3 truth.
+  enabled: true
+  gas: 0
+  spread_bps: 0
+
+mev:
+  enabled: false
