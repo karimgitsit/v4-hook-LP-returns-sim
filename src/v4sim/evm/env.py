@@ -33,6 +33,8 @@ class V4Env:
     modify_liquidity_router: str
     currency0: str
     currency1: str
+    decimals0: int = 18
+    decimals1: int = 18
 
     def call(self, to: str, calldata: bytes, caller: str | None = None) -> bytes:
         """Execute a state-changing call; raise on revert."""
@@ -58,10 +60,12 @@ def _deploy(evm: pyrevm.EVM, deployer: str, code: bytes) -> str:
     return addr
 
 
-def _deploy_mock_erc20(evm: pyrevm.EVM, deployer: str, name: str, symbol: str) -> str:
-    """Deploy mocks/MockERC20 with ctor (name, symbol, decimals=18) and mint to deployer."""
+def _deploy_mock_erc20(
+    evm: pyrevm.EVM, deployer: str, name: str, symbol: str, decimals: int = 18
+) -> str:
+    """Deploy mocks/MockERC20 with ctor (name, symbol, decimals) and mint to deployer."""
     code = bytecode("mocks/MockERC20.sol", "MockERC20")
-    ctor_args = abi_encode(["string", "string", "uint8"], [name, symbol, 18])
+    ctor_args = abi_encode(["string", "string", "uint8"], [name, symbol, decimals])
     addr = _deploy(evm, deployer, code + ctor_args)
     # mint(address to, uint256 amount)
     calldata = _selector("mint(address,uint256)") + abi_encode(
@@ -78,8 +82,20 @@ def _approve(evm: pyrevm.EVM, deployer: str, token: str, spender: str) -> None:
     evm.message_call(caller=deployer, to=token, calldata=calldata, gas=DEFAULT_GAS_LIMIT)
 
 
-def bootstrap_v4() -> V4Env:
-    """Deploy a fresh v4 environment and return handles."""
+def bootstrap_v4(
+    *,
+    token_a_decimals: int = 18,
+    token_b_decimals: int = 18,
+    token_a_name: str = "TokenA",
+    token_b_name: str = "TokenB",
+) -> V4Env:
+    """Deploy a fresh v4 environment and return handles.
+
+    Two mock ERC20s are deployed in argument order. Their addresses are then
+    sorted, and the resulting currency0/currency1 carry the decimals of the
+    underlying token (NOT positional — if token_b ends up with the lower
+    address, currency0.decimals == token_b_decimals).
+    """
     evm = pyrevm.EVM()
     deployer = DEPLOYER
     evm.set_balance(deployer, 10**30)
@@ -98,10 +114,13 @@ def bootstrap_v4() -> V4Env:
     modify_liq_ctor = abi_encode(["address"], [manager])
     modify_liquidity_router = _deploy(evm, deployer, modify_liq_code + modify_liq_ctor)
 
-    # Two mock ERC20s, sorted by address so currency0 < currency1.
-    token_a = _deploy_mock_erc20(evm, deployer, "TokenA", "TKA")
-    token_b = _deploy_mock_erc20(evm, deployer, "TokenB", "TKB")
-    currency0, currency1 = sorted([token_a, token_b], key=lambda a: int(a, 16))
+    # Two mock ERC20s, sorted by address so currency0 < currency1. Track each
+    # token's decimals so the runner can convert raw <-> human amounts.
+    token_a = _deploy_mock_erc20(evm, deployer, token_a_name, token_a_name[:4], token_a_decimals)
+    token_b = _deploy_mock_erc20(evm, deployer, token_b_name, token_b_name[:4], token_b_decimals)
+    tokens = [(token_a, token_a_decimals), (token_b, token_b_decimals)]
+    tokens.sort(key=lambda t: int(t[0], 16))
+    (currency0, decimals0), (currency1, decimals1) = tokens
 
     for token in (currency0, currency1):
         _approve(evm, deployer, token, swap_router)
@@ -115,4 +134,16 @@ def bootstrap_v4() -> V4Env:
         modify_liquidity_router=modify_liquidity_router,
         currency0=currency0,
         currency1=currency1,
+        decimals0=decimals0,
+        decimals1=decimals1,
+    )
+
+
+def bootstrap_v4_eth_usdc() -> V4Env:
+    """Convenience wrapper: deploy with USDC=6 dec and WETH=18 dec mocks."""
+    return bootstrap_v4(
+        token_a_decimals=6,
+        token_b_decimals=18,
+        token_a_name="USDC",
+        token_b_name="WETH",
     )

@@ -9,7 +9,7 @@ Bytecode is returned as raw bytes; ABI as the parsed list.
 from __future__ import annotations
 
 import json
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -30,7 +30,7 @@ def _load(file_sol: str, contract_name: str) -> dict:
         return json.load(f)
 
 
-@lru_cache(maxsize=None)
+@cache
 def get(file_sol: str, contract_name: str | None = None) -> dict:
     """Return parsed artifact JSON for contracts/v4-core/out/<file_sol>/<contract>.json.
 

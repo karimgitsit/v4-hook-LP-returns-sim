@@ -35,8 +35,9 @@ Built step-by-step as a vertical slice. Current step:
 
 - [x] **Step 1** — Subgraph puller for ETH/USDC 5bps, 1 week of swaps → Parquet
 - [x] **Step 2** — pyrevm bootstrap: PoolManager + PoolSwapTest + PoolModifyLiquidityTest, hello-world swap
-- [ ] Step 3 — Single-world runner (vanilla full-range)
+- [x] **Step 3** — Single-world full-range runner: replay 1 week, emit hourly equity snapshots
 - [ ] Step 4 — Arb-to-truth step
+- [ ] Step 4 — Arb-to-truth step (without this, the pool drifts and equity is at *pool* price, not market — see "Step 3 caveat" below)
 - [ ] Step 5 — Concentrated baseline (second parallel world)
 - [ ] Step 6 — Hook world + adapter
 - [ ] Step 7 — Equity + attribution plots
@@ -127,3 +128,32 @@ Driven from `configs/*.yaml`, with sensible defaults baked in:
 | Gas price                         | single fixed value per run                |
 | Arb                               | perfect (zero gas, zero spread)           |
 | MEV / reorgs                      | not modelled in v1                        |
+
+### Replay design choices (step 3)
+
+A handful of decisions ride with every replay; calling them out so they're
+discoverable instead of buried in code:
+
+- **Token decimals match real-world** — the harness deploys MockERC20s with
+  USDC=6 dec and WETH=18 dec, so swap amounts from the v3 parquet drop in
+  unscaled (modulo decimal-to-raw conversion). Catches sign/scale bugs early.
+- **Snapshot cadence: hourly** — equity is recorded once per wall-clock hour
+  by default. Per-swap snapshots (~28k/week for the 5bps pool) are kept only
+  in memory if needed for debugging.
+- **Initial price from row 0** — the pool is initialized at row 0's
+  `sqrt_price_x96_post`, and the replay loop starts at row 1. Avoids an
+  extra subgraph lookback for the prior block's price.
+
+#### Step 3 caveat
+
+Step 3 has no arb-to-truth, so each swap pushes the v4 pool further from
+the v3 source price (our pool's liquidity is much smaller than the
+mainnet 5bps pool, so impact compounds). The hourly snapshots are
+*correct* in that they reflect the pool's actual state after each swap,
+but `lp_value_usdc` is denominated in the *pool's* internal price — not
+market. Step 4 will fix this by arbing the pool back to v3's post-swap
+price between each step, at which point equity is a clean LP-perf
+number.
+
+Try it: `v4sim-replay-fullrange --limit 1000` writes
+`data/cache/equity_fullrange.parquet`.

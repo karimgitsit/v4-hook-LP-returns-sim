@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from eth_abi import encode as abi_encode
 from eth_utils import keccak
 
-from .env import DEFAULT_GAS_LIMIT, V4Env
+from .env import V4Env
 
 ZERO_ADDRESS = "0x" + "00" * 20
 ZERO_BYTES = b""
