@@ -36,8 +36,7 @@ Built step-by-step as a vertical slice. Current step:
 - [x] **Step 1** — Subgraph puller for ETH/USDC 5bps, 1 week of swaps → Parquet
 - [x] **Step 2** — pyrevm bootstrap: PoolManager + PoolSwapTest + PoolModifyLiquidityTest, hello-world swap
 - [x] **Step 3** — Single-world full-range runner: replay 1 week, emit hourly equity snapshots
-- [ ] Step 4 — Arb-to-truth step
-- [ ] Step 4 — Arb-to-truth step (without this, the pool drifts and equity is at *pool* price, not market — see "Step 3 caveat" below)
+- [x] **Step 4** — Arb-to-truth: pool tracks v3 √P within 1 tick after each swap; arb PnL booked as value extracted from LPs
 - [ ] Step 5 — Concentrated baseline (second parallel world)
 - [ ] Step 6 — Hook world + adapter
 - [ ] Step 7 — Equity + attribution plots
@@ -144,16 +143,45 @@ discoverable instead of buried in code:
   `sqrt_price_x96_post`, and the replay loop starts at row 1. Avoids an
   extra subgraph lookback for the prior block's price.
 
-#### Step 3 caveat
+### Arb-to-truth (step 4)
 
-Step 3 has no arb-to-truth, so each swap pushes the v4 pool further from
-the v3 source price (our pool's liquidity is much smaller than the
-mainnet 5bps pool, so impact compounds). The hourly snapshots are
-*correct* in that they reflect the pool's actual state after each swap,
-but `lp_value_usdc` is denominated in the *pool's* internal price — not
-market. Step 4 will fix this by arbing the pool back to v3's post-swap
-price between each step, at which point equity is a clean LP-perf
-number.
+After each replayed swap, a perfect arbitrageur pushes the v4 pool's
+sqrtPrice back to the v3 source's post-swap sqrtPrice (the "truth").
+Mechanism: a swap call with a huge `amountSpecified` and
+`sqrtPriceLimitX96 = target`, so the v4 pool's own swap loop terminates
+exactly at the target tick — no Python-side bisection needed.
 
-Try it: `v4sim-replay-fullrange --limit 1000` writes
-`data/cache/equity_fullrange.parquet`.
+The arb's signed token delta is valued at the truth price and accumulated
+as `cum_arb_extracted_usdc` on each snapshot. Positive = value extracted
+from the LP (i.e. LVR). Negative would mean the pool's fee dwarfed the
+arb opportunity (unusual in our undersized pool).
+
+Defaults to on. `--no-arb` toggles step-3-style drift mode for
+diagnostics.
+
+### Replay CLI
+
+```bash
+# whole parquet (one week of swaps for the 5bps pool)
+v4sim-replay-fullrange
+
+# pick a window
+v4sim-replay-fullrange --days 2                       # last 2 days
+v4sim-replay-fullrange --start 2026-05-20 --end 2026-05-22
+
+# diagnostics
+v4sim-replay-fullrange --limit 1000 --no-arb          # step-3 drift mode
+```
+
+The output parquet (`data/cache/equity_fullrange.parquet` by default)
+holds one row per snapshot: ts, tick, LP underlying amounts, LP value in
+USDC at the pool's current price, and cumulative arb extraction.
+
+#### Why is `cum_arb_extracted_usdc` so large?
+
+Our default LP is $1M-equivalent against a real-world pool with $100M+
+liquidity. Same-size swaps move our small pool ~100× more, and the arb
+captures the full impact each time. A week-long run on the 5bps ETH/USDC
+parquet currently shows ~$200M cumulative extraction (i.e. catastrophic
+LVR) on a stable $1M LP equity — exactly the LVR-vs-fees story you'd
+expect when your LP is undersized for the swap volume.
