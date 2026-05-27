@@ -34,7 +34,7 @@ for the hook world — a liquidity-placement-over-time view.
 Built step-by-step as a vertical slice. Current step:
 
 - [x] **Step 1** — Subgraph puller for ETH/USDC 5bps, 1 week of swaps → Parquet
-- [ ] Step 2 — pyrevm bootstrap (PoolManager + PoolSwapTest + PoolModifyLiquidityTest)
+- [x] **Step 2** — pyrevm bootstrap: PoolManager + PoolSwapTest + PoolModifyLiquidityTest, hello-world swap
 - [ ] Step 3 — Single-world runner (vanilla full-range)
 - [ ] Step 4 — Arb-to-truth step
 - [ ] Step 5 — Concentrated baseline (second parallel world)
@@ -57,6 +57,29 @@ python -c "import polars as pl; \
   df = pl.read_parquet('data/cache/swaps_eth_usdc_5bps.parquet'); \
   print(df.shape); print(df.head())"
 ```
+
+## Bootstrapping the EVM harness (step 2)
+
+The pyrevm harness deploys real v4-core bytecode, so the foundry artifacts
+have to exist locally. They're gitignored — build them once after cloning:
+
+```bash
+# 1. pull the submodules
+git submodule update --init --recursive
+
+# 2. install foundry (forge); see https://book.getfoundry.sh/getting-started/installation
+# 3. install solc 0.8.26 (svm-rs or a manual binary)
+
+# 4. compile v4-core into out/
+./scripts/build_contracts.sh
+```
+
+`scripts/build_contracts.sh` uses the `debug` foundry profile (no via_ir,
+`optimizer_runs = 200`) so it finishes in seconds — we don't need a
+gas-optimized binary for simulation.
+
+The harness loads JSON artifacts from `contracts/v4-core/out/`. The relevant
+tests skip with a clear message if those are missing.
 
 ### Getting a Graph API key
 

@@ -21,6 +21,9 @@ dependencies = [
     "plotly>=5.20",
     # EVM (used from step 2 on)
     "pyrevm>=0.3.3,<0.4; python_version >= '3.11'",
+    "eth-abi>=5.0",
+    "eth-utils>=4.0",
+    "eth-hash[pycryptodome]>=0.7",
 ]
 
 [project.optional-dependencies]
