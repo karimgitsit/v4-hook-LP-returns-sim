@@ -45,11 +45,32 @@ def get(file_sol: str, contract_name: str | None = None) -> dict:
 
 def bytecode(file_sol: str, contract_name: str | None = None) -> bytes:
     art = get(file_sol, contract_name)
-    obj = art["bytecode"]["object"]
+    return creation_code(art)
+
+
+def abi(file_sol: str, contract_name: str | None = None) -> list:
+    return get(file_sol, contract_name)["abi"]
+
+
+def _hex_to_bytes(obj: str) -> bytes:
     if obj.startswith("0x"):
         obj = obj[2:]
     return bytes.fromhex(obj)
 
 
-def abi(file_sol: str, contract_name: str | None = None) -> list:
-    return get(file_sol, contract_name)["abi"]
+def creation_code(artifact: dict) -> bytes:
+    """Creation (constructor) bytecode from a forge artifact dict."""
+    return _hex_to_bytes(artifact["bytecode"]["object"])
+
+
+def load_artifact_file(path: str | Path) -> dict:
+    """Load a forge artifact JSON from an arbitrary path.
+
+    This is the entry point for user-supplied hooks: the `out/MyHook.sol/
+    MyHook.json` a user gets from running `forge build` in their own repo.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise ArtifactNotFound(f"artifact not found: {p}")
+    with p.open() as f:
+        return json.load(f)

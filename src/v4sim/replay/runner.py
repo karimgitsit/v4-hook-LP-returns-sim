@@ -26,8 +26,10 @@ from pathlib import Path
 import polars as pl
 
 from v4sim.evm.arb import arb_to_target
+from v4sim.evm.artifacts import creation_code
 from v4sim.evm.env import V4Env, bootstrap_v4_eth_usdc
-from v4sim.evm.pool import PoolKey, initialize, modify_liquidity, read_slot0, swap
+from v4sim.evm.hookmine import deploy_hook
+from v4sim.evm.pool import ZERO_ADDRESS, PoolKey, initialize, modify_liquidity, read_slot0, swap
 from v4sim.evm.tickmath import get_sqrt_price_at_tick
 from v4sim.metrics.accounting import (
     amounts_for_liquidity,
@@ -41,6 +43,7 @@ from v4sim.strategies.full_range import (
     MIN_SQRT_PRICE_X96,
     usable_tick_range,
 )
+from v4sim.strategies.hook_adapter import PASSIVE_ADAPTER, HookAdapter
 
 log = logging.getLogger(__name__)
 
@@ -59,13 +62,24 @@ SOURCE_TOKEN0_IS_USDC = True
 # --------------------------------------------------------------------------
 @dataclass(frozen=True)
 class WorldSpec:
-    """Declarative config for one replay world."""
+    """Declarative config for one replay world.
+
+    `band_pct` controls LP placement for every kind: None = full-range,
+    a fraction = a ±band_pct concentrated position. `kind="hook"` additionally
+    deploys the hook from `hook_artifact` at a flag-valid address and attaches
+    it to the pool.
+    """
 
     name: str
-    kind: str = "full_range"  # "full_range" | "concentrated"
+    kind: str = "full_range"  # "full_range" | "concentrated" | "hook"
     fee: int = DEFAULT_FEE
     tick_spacing: int = DEFAULT_TICK_SPACING
-    band_pct: float | None = None  # required for concentrated
+    band_pct: float | None = None
+    # kind == "hook" only:
+    hook_artifact: dict | None = None  # forge artifact JSON (parsed)
+    hook_flags: int = 0  # required v4 permission bits (low 14 of the address)
+    hook_constructor_args: bytes = b""  # ABI-encoded ctor args
+    adapter: HookAdapter | None = None  # None -> passive (no rebalance)
 
 
 @dataclass
@@ -77,10 +91,13 @@ class _World:
     sqrt_b_x96: int
     liquidity: int
     usdc_is_currency0: bool
+    hook_addr: str = ZERO_ADDRESS
+    adapter: HookAdapter | None = None
     cum_arb: float = 0.0
     arbs: int = 0
     executed: int = 0
     skipped: int = 0
+    rebalances: int = 0
 
 
 @dataclass
@@ -95,6 +112,8 @@ class WorldResult:
     swaps_executed: int
     swaps_skipped: int
     arbs_executed: int
+    rebalances: int = 0
+    hook_addr: str = ZERO_ADDRESS
 
 
 @dataclass
@@ -280,6 +299,14 @@ def replay_worlds(
                         usdc_is_currency0=w.usdc_is_currency0,
                     )
 
+            # Tick keeper: let an active hook rebalance at the (post-arb) truth
+            # price. Passive worlds have no adapter; the no-op adapter returns
+            # False. The call site is here so real hooks plug in unchanged.
+            if w.adapter is not None:
+                keeper_price = truth_sp if truth_sp is not None else read_slot0(w.env, w.key).sqrt_price_x96
+                if w.adapter.rebalance(w.env, w.key, keeper_price):
+                    w.rebalances += 1
+
         ts = int(row["ts"])
         if ts - last_snap_ts >= snapshot_period_s:
             for w in worlds:
@@ -308,6 +335,8 @@ def replay_worlds(
             swaps_executed=w.executed,
             swaps_skipped=w.skipped,
             arbs_executed=w.arbs,
+            rebalances=w.rebalances,
+            hook_addr=w.hook_addr,
         )
     return WorldsResult(snapshots=snap_df, worlds=results)
 
@@ -315,29 +344,51 @@ def replay_worlds(
 def _build_world(
     spec: WorldSpec, env: V4Env, init_sqrt_x96: int, lp_notional_usdc: float
 ) -> _World:
-    """Build a world, rescaling liquidity so its value == lp_notional_usdc."""
+    """Build a world, rescaling liquidity so its value == lp_notional_usdc.
+
+    Placement is governed by `band_pct` for every kind (None = full-range).
+    `kind == "hook"` first deploys the hook at a flag-valid address and
+    attaches it to the pool; the no-op test hook leaves mechanics unchanged so
+    its world tracks the matching vanilla baseline.
+    """
+    if spec.kind not in ("full_range", "concentrated", "hook"):
+        raise ValueError(f"unknown world kind {spec.kind!r}")
+
     usdc_is_currency0 = env.decimals0 == 6
+
+    hook_addr = ZERO_ADDRESS
+    adapter: HookAdapter | None = None
+    if spec.kind == "hook":
+        if spec.hook_artifact is None:
+            raise ValueError("hook world requires hook_artifact")
+        hook_addr = deploy_hook(
+            env,
+            creation_code(spec.hook_artifact),
+            spec.hook_flags,
+            constructor_args=spec.hook_constructor_args,
+        )
+        adapter = spec.adapter or PASSIVE_ADAPTER
+
     key = PoolKey(
         currency0=env.currency0,
         currency1=env.currency1,
         fee=spec.fee,
         tick_spacing=spec.tick_spacing,
+        hooks=hook_addr,
     )
     init_tick = initialize(env, key, init_sqrt_x96)
     amount0_raw, amount1_raw = _split_50_50_amounts(
         env, init_sqrt_x96, lp_notional_usdc, usdc_is_currency0=usdc_is_currency0
     )
 
-    if spec.kind == "full_range":
+    # LP placement by band: None -> full range, else a ±band_pct position.
+    if spec.band_pct is None:
         sqrt_a, sqrt_b = MIN_SQRT_PRICE_X96, MAX_SQRT_PRICE_X96
         lower, upper = usable_tick_range(spec.tick_spacing)
-    elif spec.kind == "concentrated":
-        band = spec.band_pct if spec.band_pct is not None else DEFAULT_BAND_PCT
-        lower, upper = band_ticks(init_tick, spec.tick_spacing, band)
+    else:
+        lower, upper = band_ticks(init_tick, spec.tick_spacing, spec.band_pct)
         sqrt_a = get_sqrt_price_at_tick(lower)
         sqrt_b = get_sqrt_price_at_tick(upper)
-    else:
-        raise ValueError(f"unknown world kind {spec.kind!r}")
 
     liquidity = liquidity_for_amounts(init_sqrt_x96, sqrt_a, sqrt_b, amount0_raw, amount1_raw)
     liquidity = _rescale_to_notional(
@@ -354,6 +405,8 @@ def _build_world(
         sqrt_b_x96=sqrt_b,
         liquidity=liquidity,
         usdc_is_currency0=usdc_is_currency0,
+        hook_addr=hook_addr,
+        adapter=adapter,
     )
 
 
@@ -397,6 +450,26 @@ def default_baseline_specs(band_pct: float = DEFAULT_BAND_PCT) -> list[WorldSpec
         WorldSpec(name="full_range", kind="full_range"),
         WorldSpec(name="concentrated", kind="concentrated", band_pct=band_pct),
     ]
+
+
+def noop_hook_spec(name: str = "hook", band_pct: float = DEFAULT_BAND_PCT) -> WorldSpec:
+    """A transparent hook world built on v4-core's MockHooks.
+
+    MockHooks returns the correct selector and zero delta from every callback,
+    so attaching it (with only the afterInitialize flag) leaves pool mechanics
+    identical to a vanilla concentrated LP. Used to prove the hook plumbing is
+    transparent before a real hook is plugged in.
+    """
+    from v4sim.evm.artifacts import get
+    from v4sim.evm.hookmine import AFTER_INITIALIZE_FLAG
+
+    return WorldSpec(
+        name=name,
+        kind="hook",
+        band_pct=band_pct,
+        hook_artifact=get("MockHooks.sol", "MockHooks"),
+        hook_flags=AFTER_INITIALIZE_FLAG,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -463,6 +536,18 @@ def cli(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-arb", action="store_true", help="disable arb-to-truth (drift mode)"
     )
+    parser.add_argument(
+        "--hook", type=Path, default=None,
+        help="forge artifact JSON for a hook to add as a third world",
+    )
+    parser.add_argument(
+        "--hook-flags", type=lambda s: int(s, 0), default=None,
+        help="hook permission flag bits (low 14 of the address), e.g. 0x40 for afterSwap",
+    )
+    parser.add_argument(
+        "--demo-hook", action="store_true",
+        help="add a transparent no-op hook world (v4-core MockHooks) for plumbing demos",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -485,9 +570,27 @@ def cli(argv: list[str] | None = None) -> int:
         args.swaps,
     )
 
+    specs = default_baseline_specs(band_pct=args.band_pct)
+    if args.demo_hook:
+        specs.append(noop_hook_spec(band_pct=args.band_pct))
+    if args.hook is not None:
+        if args.hook_flags is None:
+            parser.error("--hook requires --hook-flags")
+        from v4sim.evm.artifacts import load_artifact_file
+
+        specs.append(
+            WorldSpec(
+                name="hook",
+                kind="hook",
+                band_pct=args.band_pct,
+                hook_artifact=load_artifact_file(args.hook),
+                hook_flags=args.hook_flags,
+            )
+        )
+
     res = replay_worlds(
         df,
-        default_baseline_specs(band_pct=args.band_pct),
+        specs,
         snapshot_period_s=args.snapshot_period_s,
         lp_notional_usdc=args.lp_notional_usdc,
         arb_to_truth=not args.no_arb,

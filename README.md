@@ -38,7 +38,7 @@ Built step-by-step as a vertical slice. Current step:
 - [x] **Step 3** — Single-world full-range runner: replay 1 week, emit hourly equity snapshots
 - [x] **Step 4** — Arb-to-truth: pool tracks v3 √P within 1 tick after each swap; arb PnL booked as value extracted from LPs
 - [x] **Step 5** — Concentrated ±10% baseline as a second parallel world; multi-world replay engine
-- [ ] Step 6 — Generic hook world + adapter framework (load any hook from a forge artifact JSON)
+- [x] **Step 6** — Generic hook world: CREATE2 HookMiner, load any hook from a forge artifact JSON, adapter seam + tick-keeper call site
 - [ ] Step 7 — Visual report + Streamlit UI (3-line equity, attribution, liquidity placement; paste-a-hook flow)
 
 ### Where this is going
@@ -188,8 +188,8 @@ another was meant to earn on. The two vanilla baselines:
 
 Both are sized to **exactly** $1M of value at t=0 (liquidity is rescaled
 post-hoc), so the comparison is fair regardless of band width. Snapshots
-are long-form — one row per `(ts, world)` — so adding the hook world in
-step 6 is just another entry in the spec list.
+are long-form — one row per `(ts, world)` — so adding the hook world is
+just another entry in the spec list.
 
 Note: thinner liquidity bleeds more to the arb per swap (LVR ∝ 1/L), so
 the full-range world shows much larger `cum_arb_extracted_usdc` than the
@@ -210,11 +210,41 @@ v4sim-replay --start 2026-05-20 --end 2026-05-22
 # tune the concentrated band, or run drift diagnostics
 v4sim-replay --band-pct 0.05
 v4sim-replay --limit 1000 --no-arb          # step-3 drift mode
+
+# add a hook world (step 6)
+v4sim-replay --demo-hook                    # transparent no-op hook (MockHooks)
+v4sim-replay --hook out/MyHook.sol/MyHook.json --hook-flags 0x40  # afterSwap
 ```
 
 The output parquet (`data/cache/equity_worlds.parquet` by default) holds
 one row per snapshot per world: ts, world, tick, LP underlying amounts, LP
 value in USDC at the pool's current price, and cumulative arb extraction.
+
+### Hooks (step 6)
+
+A hook world deploys a v4 hook and attaches it to the pool. Because v4
+encodes a hook's permissions in the **low 14 bits of its address**, the
+harness includes a Python HookMiner (`evm/hookmine.py`): it deploys a tiny
+CREATE2 factory, brute-forces a salt until `address & 0x3FFF == flags`, then
+deploys the hook there (running its constructor, so stateful hooks work too).
+
+To plug in your own hook:
+
+1. `forge build` it in your repo and grab `out/MyHook.sol/MyHook.json`.
+2. Pass `--hook <path> --hook-flags <bits>` (the bits must match the hook's
+   declared `getHookPermissions`, e.g. `0x40` for `afterSwap`).
+3. If the hook's LP verbs differ from the standard
+   `deposit/withdraw/rebalance`, subclass `HookAdapter`
+   (`strategies/hook_adapter.py`) in ~30 lines under `adapters/`.
+
+The tick keeper calls `adapter.rebalance(...)` after each swap+arb at the
+truth price; the base (passive) adapter is a no-op, so today a hook world
+holds a vanilla position and the active deposit/withdraw/rebalance paths
+fill in once a real hook (directional-liquidity) lands.
+
+`--demo-hook` attaches v4-core's `MockHooks` (returns correct selectors,
+zero deltas) with only the `afterInitialize` flag — provably transparent, so
+the hook world's equity matches the concentrated baseline exactly.
 
 #### Why is `cum_arb_extracted_usdc` so large?
 
