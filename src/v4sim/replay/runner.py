@@ -1,36 +1,45 @@
-"""Single-world v4 replay: drive a freshly-deployed pool through historical
-v3 swaps, optionally arb the pool back to the v3 post-swap price between
-each step, and emit a per-snapshot equity series.
+"""Multi-world v4 replay.
 
-With `arb_to_truth=True` (the default, step-4 behaviour), the v4 pool's
-sqrtPrice tracks the source within 1 tick after every swap. The arb's
-PnL — valued at the v3 truth price — is accumulated as
-`cum_arb_extracted_usdc` and reported per-snapshot. With
-`arb_to_truth=False` (step-3 mode), the pool drifts and the equity
-series reflects the pool's internal price only.
+Drives one or more freshly-deployed v4 pools ("worlds") through the same
+historical v3 swap stream. After each user swap a perfect arbitrageur
+pushes each pool back to the v3 post-swap price (arb-to-truth, step 4);
+the arb PnL valued at truth is accumulated as `cum_arb_extracted_usdc`.
+
+Each world is an independent baseline/strategy against the same swaps:
+
+- ``full_range``   — vanilla full-range LP (step 3/4)
+- ``concentrated`` — vanilla ±band_pct LP (step 5)
+- ``hook``         — hook-equipped pool (step 6; not wired here yet)
+
+`replay_worlds` runs N worlds and returns a long-form snapshot frame keyed
+by ``(ts, world)``. `replay_full_range` is a thin single-world wrapper kept
+for the step-3/4 API and tests.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import polars as pl
 
 from v4sim.evm.arb import arb_to_target
 from v4sim.evm.env import V4Env, bootstrap_v4_eth_usdc
-from v4sim.evm.pool import PoolKey, initialize, read_slot0, swap
+from v4sim.evm.pool import PoolKey, initialize, modify_liquidity, read_slot0, swap
+from v4sim.evm.tickmath import get_sqrt_price_at_tick
 from v4sim.metrics.accounting import (
     amounts_for_liquidity,
+    liquidity_for_amounts,
     price_token1_in_token0,
     usdc_value_of_position,
 )
+from v4sim.strategies.concentrated import band_ticks
 from v4sim.strategies.full_range import (
     MAX_SQRT_PRICE_X96,
     MIN_SQRT_PRICE_X96,
-    add_full_range_position,
+    usable_tick_range,
 )
 
 log = logging.getLogger(__name__)
@@ -39,25 +48,62 @@ log = logging.getLogger(__name__)
 DEFAULT_FEE = 500  # 5bps in v4 fee units (= bps * 100)
 DEFAULT_TICK_SPACING = 10
 DEFAULT_SNAPSHOT_PERIOD_S = 3600  # hourly equity snapshots
+DEFAULT_BAND_PCT = 0.10
 
 # Source pool (real-world ETH/USDC 5bps): token0 = USDC, token1 = WETH.
 SOURCE_TOKEN0_IS_USDC = True
 
 
+# --------------------------------------------------------------------------
+# World configuration + runtime state
+# --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class WorldSpec:
+    """Declarative config for one replay world."""
+
+    name: str
+    kind: str = "full_range"  # "full_range" | "concentrated"
+    fee: int = DEFAULT_FEE
+    tick_spacing: int = DEFAULT_TICK_SPACING
+    band_pct: float | None = None  # required for concentrated
+
+
 @dataclass
-class Snapshot:
-    """One row of the equity curve."""
+class _World:
+    spec: WorldSpec
+    env: V4Env
+    key: PoolKey
+    sqrt_a_x96: int
+    sqrt_b_x96: int
+    liquidity: int
+    usdc_is_currency0: bool
+    cum_arb: float = 0.0
+    arbs: int = 0
+    executed: int = 0
+    skipped: int = 0
 
-    ts: int
-    swap_index: int
-    sqrt_price_x96: int
-    tick: int
-    lp_amount0_raw: int
-    lp_amount1_raw: int
-    lp_value_usdc: float
+
+@dataclass
+class WorldResult:
+    name: str
+    kind: str
+    initial_lp_value_usdc: float
+    final_lp_value_usdc: float
+    final_lp_amount0_raw: int
+    final_lp_amount1_raw: int
     cum_arb_extracted_usdc: float
+    swaps_executed: int
+    swaps_skipped: int
+    arbs_executed: int
 
 
+@dataclass
+class WorldsResult:
+    snapshots: pl.DataFrame  # long-form: one row per (ts, world)
+    worlds: dict[str, WorldResult] = field(default_factory=dict)
+
+
+# Kept for the step-3/4 single-world API.
 @dataclass
 class ReplayResult:
     snapshots: pl.DataFrame
@@ -71,6 +117,9 @@ class ReplayResult:
     arbs_executed: int
 
 
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
 def _parse_sqrt_price(value) -> int:
     """Parquet stores sqrtPriceX96 as a decimal string; convert to int."""
     if isinstance(value, int):
@@ -91,57 +140,220 @@ def _harness_zero_for_one(source_dir: int, usdc_is_currency0: bool) -> bool:
     return sending_usdc == usdc_is_currency0
 
 
-def _snapshot_now(
+def _value_position(
+    env: V4Env, amount0: int, amount1: int, sqrt_p_x96: int, *, usdc_is_currency0: bool
+) -> float:
+    return usdc_value_of_position(
+        amount0,
+        amount1,
+        sqrt_p_x96,
+        decimals0=env.decimals0,
+        decimals1=env.decimals1,
+        usdc_is_token0=usdc_is_currency0,
+    )
+
+
+def _split_50_50_amounts(
+    env: V4Env, init_sqrt_x96: int, lp_notional_usdc: float, *, usdc_is_currency0: bool
+) -> tuple[int, int]:
+    """Raw (amount0, amount1) for a 50/50-by-USDC-value deposit at init price."""
+    half = lp_notional_usdc / 2.0
+    p_raw = price_token1_in_token0(init_sqrt_x96)
+    price_t1_per_t0_human = p_raw * (10 ** (env.decimals0 - env.decimals1))
+    if usdc_is_currency0:
+        amount0_raw = int(half * 10**env.decimals0)
+        amount1_raw = int(half * price_t1_per_t0_human * 10**env.decimals1)
+    else:
+        amount1_raw = int(half * 10**env.decimals1)
+        amount0_raw = int(half / price_t1_per_t0_human * 10**env.decimals0)
+    return amount0_raw, amount1_raw
+
+
+def _rescale_to_notional(
     env: V4Env,
-    key: PoolKey,
     liquidity: int,
-    swap_index: int,
-    ts: int,
-    cum_arb_extracted_usdc: float,
+    sqrt_p_x96: int,
+    sqrt_a_x96: int,
+    sqrt_b_x96: int,
+    target_usdc: float,
     *,
     usdc_is_currency0: bool,
-) -> Snapshot:
-    slot0 = read_slot0(env, key)
-    amt0, amt1 = amounts_for_liquidity(
-        sqrt_p_x96=slot0.sqrt_price_x96,
-        sqrt_a_x96=MIN_SQRT_PRICE_X96,
-        sqrt_b_x96=MAX_SQRT_PRICE_X96,
-        liquidity=liquidity,
-    )
-    value = usdc_value_of_position(
-        amt0,
-        amt1,
-        slot0.sqrt_price_x96,
-        decimals0=env.decimals0,
-        decimals1=env.decimals1,
-        usdc_is_token0=usdc_is_currency0,
-    )
-    return Snapshot(
-        ts=ts,
-        swap_index=swap_index,
-        sqrt_price_x96=slot0.sqrt_price_x96,
-        tick=slot0.tick,
-        lp_amount0_raw=amt0,
-        lp_amount1_raw=amt1,
-        lp_value_usdc=value,
-        cum_arb_extracted_usdc=cum_arb_extracted_usdc,
-    )
+) -> int:
+    """Scale liquidity so the position's value at init price == target_usdc.
 
-
-def _arb_pnl_usdc(
-    env: V4Env, delta0: int, delta1: int, truth_sqrt_x96: int, *, usdc_is_currency0: bool
-) -> float:
-    """Value the arb's (delta0, delta1) at the v3 truth sqrtPrice, in USDC.
-
-    Positive return = arb captured value from LPs at the truth price.
+    Position value is linear in L, so one rescale is exact. Keeps every world
+    at the same notional regardless of band width — fair baseline comparison.
     """
-    return usdc_value_of_position(
-        delta0,
-        delta1,
-        truth_sqrt_x96,
-        decimals0=env.decimals0,
-        decimals1=env.decimals1,
-        usdc_is_token0=usdc_is_currency0,
+    amt0, amt1 = amounts_for_liquidity(sqrt_p_x96, sqrt_a_x96, sqrt_b_x96, liquidity)
+    value = _value_position(env, amt0, amt1, sqrt_p_x96, usdc_is_currency0=usdc_is_currency0)
+    if value <= 0:
+        raise ValueError(f"position value non-positive ({value})")
+    return int(liquidity * target_usdc / value)
+
+
+def _snapshot_world(world: _World, ts: int, swap_index: int) -> dict:
+    slot0 = read_slot0(world.env, world.key)
+    amt0, amt1 = amounts_for_liquidity(
+        slot0.sqrt_price_x96, world.sqrt_a_x96, world.sqrt_b_x96, world.liquidity
+    )
+    value = _value_position(
+        world.env, amt0, amt1, slot0.sqrt_price_x96, usdc_is_currency0=world.usdc_is_currency0
+    )
+    return {
+        "ts": ts,
+        "world": world.spec.name,
+        "swap_index": swap_index,
+        "sqrt_price_x96": str(slot0.sqrt_price_x96),
+        "tick": slot0.tick,
+        "lp_amount0_raw": str(amt0),
+        "lp_amount1_raw": str(amt1),
+        "lp_value_usdc": value,
+        "cum_arb_extracted_usdc": world.cum_arb,
+    }
+
+
+def replay_worlds(
+    swaps_df: pl.DataFrame,
+    specs: list[WorldSpec],
+    *,
+    lp_notional_usdc: float = 1_000_000.0,
+    snapshot_period_s: int = DEFAULT_SNAPSHOT_PERIOD_S,
+    arb_to_truth: bool = True,
+    envs: dict[str, V4Env] | None = None,
+) -> WorldsResult:
+    """Replay `swaps_df` against every world in `specs`.
+
+    Each world gets its own fresh `V4Env` (a separate PoolManager) unless one
+    is supplied for its name in `envs`. Isolation matters: a swap in one
+    world must not consume liquidity another world was meant to earn fees on.
+    """
+    if not specs:
+        raise ValueError("need at least one world spec")
+    if swaps_df.height < 2:
+        raise ValueError("need at least 2 swap rows: row 0 sets the price, row 1+ replays")
+    names = [s.name for s in specs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"world names must be unique, got {names}")
+
+    rows = swaps_df.sort(["ts", "block", "log_index"]).to_dicts()
+    init_sqrt_x96 = _parse_sqrt_price(rows[0]["sqrt_price_x96_post"])
+
+    envs = envs or {}
+    worlds: list[_World] = []
+    for spec in specs:
+        env = envs.get(spec.name) or bootstrap_v4_eth_usdc()
+        worlds.append(_build_world(spec, env, init_sqrt_x96, lp_notional_usdc))
+
+    first_ts = int(rows[0]["ts"])
+    snap_rows: list[dict] = [_snapshot_world(w, first_ts, 0) for w in worlds]
+    initial_values = {w.spec.name: snap_rows[i]["lp_value_usdc"] for i, w in enumerate(worlds)}
+    last_snap_ts = first_ts
+
+    for idx, row in enumerate(rows[1:], start=1):
+        source_dir = int(row["dir"])
+        amount_in = float(row["amount_in"])
+        truth_sp = _parse_sqrt_price(row["sqrt_price_x96_post"]) if arb_to_truth else None
+        for w in worlds:
+            z4o = _harness_zero_for_one(source_dir, w.usdc_is_currency0)
+            input_decimals = w.env.decimals0 if z4o else w.env.decimals1
+            amount_in_raw = int(amount_in * 10**input_decimals)
+            if amount_in_raw <= 0:
+                w.skipped += 1
+                continue
+            try:
+                swap(w.env, w.key, zero_for_one=z4o, amount_specified=-amount_in_raw)
+                w.executed += 1
+            except Exception as e:  # pyrevm raises a bare RuntimeError on revert
+                log.debug("world %s swap %d reverted: %s", w.spec.name, idx, e)
+                w.skipped += 1
+                continue
+            if truth_sp is not None:
+                try:
+                    arb = arb_to_target(w.env, w.key, truth_sp)
+                except Exception as e:
+                    log.debug("world %s arb %d reverted: %s", w.spec.name, idx, e)
+                    arb = None
+                if arb is not None and not arb.skipped:
+                    w.arbs += 1
+                    w.cum_arb += _value_position(
+                        w.env, arb.delta0, arb.delta1, truth_sp,
+                        usdc_is_currency0=w.usdc_is_currency0,
+                    )
+
+        ts = int(row["ts"])
+        if ts - last_snap_ts >= snapshot_period_s:
+            for w in worlds:
+                snap_rows.append(_snapshot_world(w, ts, idx))
+            last_snap_ts = ts
+
+    last_ts = int(rows[-1]["ts"])
+    if last_ts != last_snap_ts:
+        for w in worlds:
+            snap_rows.append(_snapshot_world(w, last_ts, len(rows) - 1))
+
+    snap_df = pl.DataFrame(snap_rows)
+
+    results: dict[str, WorldResult] = {}
+    for w in worlds:
+        wrows = snap_df.filter(pl.col("world") == w.spec.name)
+        final = wrows.tail(1).to_dicts()[0]
+        results[w.spec.name] = WorldResult(
+            name=w.spec.name,
+            kind=w.spec.kind,
+            initial_lp_value_usdc=initial_values[w.spec.name],
+            final_lp_value_usdc=final["lp_value_usdc"],
+            final_lp_amount0_raw=int(final["lp_amount0_raw"]),
+            final_lp_amount1_raw=int(final["lp_amount1_raw"]),
+            cum_arb_extracted_usdc=w.cum_arb,
+            swaps_executed=w.executed,
+            swaps_skipped=w.skipped,
+            arbs_executed=w.arbs,
+        )
+    return WorldsResult(snapshots=snap_df, worlds=results)
+
+
+def _build_world(
+    spec: WorldSpec, env: V4Env, init_sqrt_x96: int, lp_notional_usdc: float
+) -> _World:
+    """Build a world, rescaling liquidity so its value == lp_notional_usdc."""
+    usdc_is_currency0 = env.decimals0 == 6
+    key = PoolKey(
+        currency0=env.currency0,
+        currency1=env.currency1,
+        fee=spec.fee,
+        tick_spacing=spec.tick_spacing,
+    )
+    init_tick = initialize(env, key, init_sqrt_x96)
+    amount0_raw, amount1_raw = _split_50_50_amounts(
+        env, init_sqrt_x96, lp_notional_usdc, usdc_is_currency0=usdc_is_currency0
+    )
+
+    if spec.kind == "full_range":
+        sqrt_a, sqrt_b = MIN_SQRT_PRICE_X96, MAX_SQRT_PRICE_X96
+        lower, upper = usable_tick_range(spec.tick_spacing)
+    elif spec.kind == "concentrated":
+        band = spec.band_pct if spec.band_pct is not None else DEFAULT_BAND_PCT
+        lower, upper = band_ticks(init_tick, spec.tick_spacing, band)
+        sqrt_a = get_sqrt_price_at_tick(lower)
+        sqrt_b = get_sqrt_price_at_tick(upper)
+    else:
+        raise ValueError(f"unknown world kind {spec.kind!r}")
+
+    liquidity = liquidity_for_amounts(init_sqrt_x96, sqrt_a, sqrt_b, amount0_raw, amount1_raw)
+    liquidity = _rescale_to_notional(
+        env, liquidity, init_sqrt_x96, sqrt_a, sqrt_b, lp_notional_usdc,
+        usdc_is_currency0=usdc_is_currency0,
+    )
+    modify_liquidity(env, key, tick_lower=lower, tick_upper=upper, liquidity_delta=liquidity)
+
+    return _World(
+        spec=spec,
+        env=env,
+        key=key,
+        sqrt_a_x96=sqrt_a,
+        sqrt_b_x96=sqrt_b,
+        liquidity=liquidity,
+        usdc_is_currency0=usdc_is_currency0,
     )
 
 
@@ -155,179 +367,55 @@ def replay_full_range(
     env: V4Env | None = None,
     arb_to_truth: bool = True,
 ) -> ReplayResult:
-    """Replay a swap stream against a fresh v4 full-range pool.
-
-    Parameters
-    ----------
-    swaps_df :
-        Polars frame matching `v4sim.data.schema.SWAP_SCHEMA`.
-    fee :
-        v4 pool LP fee in hundredths-of-a-bip (500 = 5bps).
-    tick_spacing :
-        Pool tick spacing (10 for the 5bps ETH/USDC pool).
-    lp_notional_usdc :
-        Total USDC-equivalent value of the LP deposit at the initial price.
-        Split 50/50 across the two sides.
-    snapshot_period_s :
-        Wall-clock seconds between equity snapshots.
-    arb_to_truth :
-        If True (default, step 4), after each user swap a perfect arb pushes
-        the pool's sqrtPrice back to the row's `sqrt_price_x96_post`. If
-        False (step 3 diagnostic mode), no arb runs and the pool drifts.
-
-    Returns
-    -------
-    ReplayResult holding a polars frame of snapshots plus run-level stats.
-    """
-    if swaps_df.height < 2:
-        raise ValueError("need at least 2 swap rows: row 0 sets the price, row 1+ replays")
-
-    env = env or bootstrap_v4_eth_usdc()
-    usdc_is_currency0 = env.decimals0 == 6
-    key = PoolKey(
-        currency0=env.currency0,
-        currency1=env.currency1,
-        fee=fee,
-        tick_spacing=tick_spacing,
+    """Single full-range world. Thin wrapper over `replay_worlds` (step 3/4 API)."""
+    spec = WorldSpec(name="full_range", kind="full_range", fee=fee, tick_spacing=tick_spacing)
+    res = replay_worlds(
+        swaps_df,
+        [spec],
+        lp_notional_usdc=lp_notional_usdc,
+        snapshot_period_s=snapshot_period_s,
+        arb_to_truth=arb_to_truth,
+        envs={"full_range": env} if env is not None else None,
     )
-
-    rows = swaps_df.sort(["ts", "block", "log_index"]).to_dicts()
-
-    # Initial sqrtPrice = row 0's `sqrt_price_x96_post` (project decision).
-    init_sqrt_x96 = _parse_sqrt_price(rows[0]["sqrt_price_x96_post"])
-    initialize(env, key, init_sqrt_x96)
-
-    # 50/50 USDC value at the initial price.
-    half_usdc = lp_notional_usdc / 2.0
-    p_raw = price_token1_in_token0(init_sqrt_x96)
-    price_t1_per_t0_human = p_raw * (10 ** (env.decimals0 - env.decimals1))
-    if usdc_is_currency0:
-        amount0_raw = int(half_usdc * 10**env.decimals0)
-        amount1_raw = int(half_usdc * price_t1_per_t0_human * 10**env.decimals1)
-    else:
-        amount1_raw = int(half_usdc * 10**env.decimals1)
-        amount0_raw = int(half_usdc / price_t1_per_t0_human * 10**env.decimals0)
-
-    liquidity, _, _ = add_full_range_position(
-        env,
-        key,
-        sqrt_price_x96=init_sqrt_x96,
-        amount0=amount0_raw,
-        amount1=amount1_raw,
-        tick_spacing=tick_spacing,
-    )
-
-    snapshots: list[Snapshot] = []
-    cum_arb = 0.0
-    initial_snap = _snapshot_now(
-        env,
-        key,
-        liquidity,
-        swap_index=0,
-        ts=int(rows[0]["ts"]),
-        cum_arb_extracted_usdc=cum_arb,
-        usdc_is_currency0=usdc_is_currency0,
-    )
-    snapshots.append(initial_snap)
-    last_snap_ts = initial_snap.ts
-
-    executed = 0
-    skipped = 0
-    arbs = 0
-    for idx, row in enumerate(rows[1:], start=1):
-        z4o = _harness_zero_for_one(int(row["dir"]), usdc_is_currency0)
-        input_decimals = env.decimals0 if z4o else env.decimals1
-        amount_in_raw = int(float(row["amount_in"]) * 10**input_decimals)
-        if amount_in_raw <= 0:
-            skipped += 1
-            continue
-        try:
-            swap(env, key, zero_for_one=z4o, amount_specified=-amount_in_raw)
-            executed += 1
-        except Exception as e:  # pyrevm raises a bare RuntimeError on revert
-            log.debug("swap %d reverted: %s", idx, e)
-            skipped += 1
-            continue
-
-        if arb_to_truth:
-            truth_sp = _parse_sqrt_price(row["sqrt_price_x96_post"])
-            arb = arb_to_target(env, key, truth_sp)
-            if not arb.skipped:
-                arbs += 1
-                cum_arb += _arb_pnl_usdc(
-                    env,
-                    arb.delta0,
-                    arb.delta1,
-                    truth_sp,
-                    usdc_is_currency0=usdc_is_currency0,
-                )
-
-        ts = int(row["ts"])
-        if ts - last_snap_ts >= snapshot_period_s:
-            snapshots.append(
-                _snapshot_now(
-                    env,
-                    key,
-                    liquidity,
-                    swap_index=idx,
-                    ts=ts,
-                    cum_arb_extracted_usdc=cum_arb,
-                    usdc_is_currency0=usdc_is_currency0,
-                )
-            )
-            last_snap_ts = ts
-
-    final_snap = _snapshot_now(
-        env,
-        key,
-        liquidity,
-        swap_index=len(rows) - 1,
-        ts=int(rows[-1]["ts"]),
-        cum_arb_extracted_usdc=cum_arb,
-        usdc_is_currency0=usdc_is_currency0,
-    )
-    if not snapshots or snapshots[-1].ts != final_snap.ts:
-        snapshots.append(final_snap)
-
-    snap_df = pl.DataFrame(
-        {
-            "ts": [s.ts for s in snapshots],
-            "swap_index": [s.swap_index for s in snapshots],
-            "sqrt_price_x96": [str(s.sqrt_price_x96) for s in snapshots],
-            "tick": [s.tick for s in snapshots],
-            "lp_amount0_raw": [str(s.lp_amount0_raw) for s in snapshots],
-            "lp_amount1_raw": [str(s.lp_amount1_raw) for s in snapshots],
-            "lp_value_usdc": [s.lp_value_usdc for s in snapshots],
-            "cum_arb_extracted_usdc": [s.cum_arb_extracted_usdc for s in snapshots],
-        }
-    )
-
+    w = res.worlds["full_range"]
     return ReplayResult(
-        snapshots=snap_df,
-        final_lp_amount0_raw=final_snap.lp_amount0_raw,
-        final_lp_amount1_raw=final_snap.lp_amount1_raw,
-        initial_lp_value_usdc=initial_snap.lp_value_usdc,
-        final_lp_value_usdc=final_snap.lp_value_usdc,
-        cum_arb_extracted_usdc=cum_arb,
-        swaps_executed=executed,
-        swaps_skipped=skipped,
-        arbs_executed=arbs,
+        snapshots=res.snapshots,
+        final_lp_amount0_raw=w.final_lp_amount0_raw,
+        final_lp_amount1_raw=w.final_lp_amount1_raw,
+        initial_lp_value_usdc=w.initial_lp_value_usdc,
+        final_lp_value_usdc=w.final_lp_value_usdc,
+        cum_arb_extracted_usdc=w.cum_arb_extracted_usdc,
+        swaps_executed=w.swaps_executed,
+        swaps_skipped=w.swaps_skipped,
+        arbs_executed=w.arbs_executed,
     )
 
 
+def default_baseline_specs(band_pct: float = DEFAULT_BAND_PCT) -> list[WorldSpec]:
+    """The two vanilla baselines every hook gets compared against."""
+    return [
+        WorldSpec(name="full_range", kind="full_range"),
+        WorldSpec(name="concentrated", kind="concentrated", band_pct=band_pct),
+    ]
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
 def _parse_when(value: str) -> int:
     """Accept either a unix ts ('1779000000') or an ISO date/datetime."""
     s = value.strip()
     if s.isdigit():
         return int(s)
-    # date-only is fine, datetime.fromisoformat handles 'YYYY-MM-DD' on 3.11+.
     parsed = dt.datetime.fromisoformat(s)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.UTC)
     return int(parsed.timestamp())
 
 
-def _apply_window(df: pl.DataFrame, *, start: int | None, end: int | None, days: int | None) -> pl.DataFrame:
+def _apply_window(
+    df: pl.DataFrame, *, start: int | None, end: int | None, days: int | None
+) -> pl.DataFrame:
     """Filter `df` by a [start, end) ts window, or to the most-recent `days`."""
     if days is not None and (start is not None or end is not None):
         raise ValueError("--days is mutually exclusive with --start/--end")
@@ -345,59 +433,35 @@ def _apply_window(df: pl.DataFrame, *, start: int | None, end: int | None, days:
 
 
 def cli(argv: list[str] | None = None) -> int:
-    """Replay a parquet of swaps, arb back to truth after each, and dump snapshots."""
+    """Replay the baselines (full-range + concentrated) and dump long-form snapshots."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="v4 full-range replay with arb-to-truth (step 4)")
+    parser = argparse.ArgumentParser(description="v4 multi-world replay with arb-to-truth")
     parser.add_argument(
-        "--swaps",
-        type=Path,
-        default=Path("data/cache/swaps_88e6a0c2.parquet"),
+        "--swaps", type=Path, default=Path("data/cache/swaps_88e6a0c2.parquet"),
         help="path to the step-1 swap parquet",
     )
     parser.add_argument(
-        "--out",
-        type=Path,
-        default=Path("data/cache/equity_fullrange.parquet"),
-        help="output path for the equity snapshot parquet",
+        "--out", type=Path, default=Path("data/cache/equity_worlds.parquet"),
+        help="output path for the long-form equity snapshot parquet",
+    )
+    parser.add_argument("--start", type=str, default=None, help="window start (ISO or unix ts)")
+    parser.add_argument("--end", type=str, default=None, help="window end (exclusive)")
+    parser.add_argument("--days", type=int, default=None, help="take the last N days of the parquet")
+    parser.add_argument("--limit", type=int, default=0, help="cap on rows after windowing (0 = all)")
+    parser.add_argument(
+        "--band-pct", type=float, default=DEFAULT_BAND_PCT,
+        help="concentrated baseline half-bandwidth (0.10 = ±10%%)",
     )
     parser.add_argument(
-        "--start",
-        type=str,
-        default=None,
-        help="window start (ISO datetime, ISO date, or unix ts); inclusive",
-    )
-    parser.add_argument(
-        "--end",
-        type=str,
-        default=None,
-        help="window end (same formats as --start); exclusive",
-    )
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=None,
-        help="alternative to --start/--end: take the last N days of the parquet",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help="cap on rows after windowing (0 = all)",
-    )
-    parser.add_argument(
-        "--snapshot-period-s",
-        type=int,
-        default=DEFAULT_SNAPSHOT_PERIOD_S,
+        "--snapshot-period-s", type=int, default=DEFAULT_SNAPSHOT_PERIOD_S,
         help="seconds between equity snapshots",
     )
     parser.add_argument(
         "--lp-notional-usdc", type=float, default=1_000_000.0, help="LP USDC value at t=0"
     )
     parser.add_argument(
-        "--no-arb",
-        action="store_true",
-        help="disable arb-to-truth (step-3 diagnostic mode)",
+        "--no-arb", action="store_true", help="disable arb-to-truth (drift mode)"
     )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -421,23 +485,20 @@ def cli(argv: list[str] | None = None) -> int:
         args.swaps,
     )
 
-    result = replay_full_range(
+    res = replay_worlds(
         df,
+        default_baseline_specs(band_pct=args.band_pct),
         snapshot_period_s=args.snapshot_period_s,
         lp_notional_usdc=args.lp_notional_usdc,
         arb_to_truth=not args.no_arb,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    result.snapshots.write_parquet(args.out)
-    log.info(
-        "executed=%d skipped=%d arbs=%d snapshots=%d initial=%.2f final=%.2f cum_arb=%.2f -> %s",
-        result.swaps_executed,
-        result.swaps_skipped,
-        result.arbs_executed,
-        result.snapshots.height,
-        result.initial_lp_value_usdc,
-        result.final_lp_value_usdc,
-        result.cum_arb_extracted_usdc,
-        args.out,
-    )
+    res.snapshots.write_parquet(args.out)
+    for name, w in res.worlds.items():
+        log.info(
+            "[%s] executed=%d skipped=%d arbs=%d initial=%.2f final=%.2f cum_arb=%.2f",
+            name, w.swaps_executed, w.swaps_skipped, w.arbs_executed,
+            w.initial_lp_value_usdc, w.final_lp_value_usdc, w.cum_arb_extracted_usdc,
+        )
+    log.info("wrote %d snapshot rows -> %s", res.snapshots.height, args.out)
     return 0

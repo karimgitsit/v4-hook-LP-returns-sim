@@ -37,9 +37,26 @@ Built step-by-step as a vertical slice. Current step:
 - [x] **Step 2** — pyrevm bootstrap: PoolManager + PoolSwapTest + PoolModifyLiquidityTest, hello-world swap
 - [x] **Step 3** — Single-world full-range runner: replay 1 week, emit hourly equity snapshots
 - [x] **Step 4** — Arb-to-truth: pool tracks v3 √P within 1 tick after each swap; arb PnL booked as value extracted from LPs
-- [ ] Step 5 — Concentrated baseline (second parallel world)
-- [ ] Step 6 — Hook world + adapter
-- [ ] Step 7 — Equity + attribution plots
+- [x] **Step 5** — Concentrated ±10% baseline as a second parallel world; multi-world replay engine
+- [ ] Step 6 — Generic hook world + adapter framework (load any hook from a forge artifact JSON)
+- [ ] Step 7 — Visual report + Streamlit UI (3-line equity, attribution, liquidity placement; paste-a-hook flow)
+
+### Where this is going
+
+This is a **general** simulator for any LP-related v4 hook, not a one-off
+for a single hook. The intended end-to-end flow:
+
+1. User compiles their hook with `forge build` and grabs the artifact JSON
+   (`out/MyHook.sol/MyHook.json`). A guided UI flow walks them through this.
+2. User pastes/uploads the artifact, picks a date range, and (if the hook's
+   deposit/withdraw verbs are non-standard) supplies a ~30-line Python
+   adapter.
+3. The tool simulates the hook against the vanilla baselines over that
+   window and renders graphs + tables (Streamlit front-end, self-contained
+   HTML export).
+
+Decisions locked for that flow: **forge artifact JSON** as the hook input
+format (step 6), **Streamlit** for the UI (step 7b).
 
 ## Quickstart
 
@@ -159,23 +176,45 @@ arb opportunity (unusual in our undersized pool).
 Defaults to on. `--no-arb` toggles step-3-style drift mode for
 diagnostics.
 
+### Worlds (step 5)
+
+Each run replays the same swap stream against N independent "worlds", one
+fresh `PoolManager` per world so a swap in one can't consume liquidity
+another was meant to earn on. The two vanilla baselines:
+
+- `full_range` — $1M LP across the whole tick range
+- `concentrated` — $1M LP in a ±10% band around the initial price
+  (configurable via `--band-pct`); passive, never rebalances
+
+Both are sized to **exactly** $1M of value at t=0 (liquidity is rescaled
+post-hoc), so the comparison is fair regardless of band width. Snapshots
+are long-form — one row per `(ts, world)` — so adding the hook world in
+step 6 is just another entry in the spec list.
+
+Note: thinner liquidity bleeds more to the arb per swap (LVR ∝ 1/L), so
+the full-range world shows much larger `cum_arb_extracted_usdc` than the
+concentrated one. Fee income — which is what compensates the concentrated
+LP for that — is tracked in step 7's attribution; until then the two
+equity curves look similar while price stays inside the band.
+
 ### Replay CLI
 
 ```bash
-# whole parquet (one week of swaps for the 5bps pool)
-v4sim-replay-fullrange
+# whole parquet (one week of swaps for the 5bps pool), both baselines
+v4sim-replay
 
 # pick a window
-v4sim-replay-fullrange --days 2                       # last 2 days
-v4sim-replay-fullrange --start 2026-05-20 --end 2026-05-22
+v4sim-replay --days 2                       # last 2 days
+v4sim-replay --start 2026-05-20 --end 2026-05-22
 
-# diagnostics
-v4sim-replay-fullrange --limit 1000 --no-arb          # step-3 drift mode
+# tune the concentrated band, or run drift diagnostics
+v4sim-replay --band-pct 0.05
+v4sim-replay --limit 1000 --no-arb          # step-3 drift mode
 ```
 
-The output parquet (`data/cache/equity_fullrange.parquet` by default)
-holds one row per snapshot: ts, tick, LP underlying amounts, LP value in
-USDC at the pool's current price, and cumulative arb extraction.
+The output parquet (`data/cache/equity_worlds.parquet` by default) holds
+one row per snapshot per world: ts, world, tick, LP underlying amounts, LP
+value in USDC at the pool's current price, and cumulative arb extraction.
 
 #### Why is `cum_arb_extracted_usdc` so large?
 
