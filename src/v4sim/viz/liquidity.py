@@ -36,12 +36,38 @@ def _price_series(snapshots: pl.DataFrame, world: WorldResult) -> list[float]:
 
 
 def liquidity_figure(snapshots: pl.DataFrame, world: WorldResult) -> go.Figure:
-    """Price path for ``world`` with its LP range shaded."""
+    """Price path for ``world`` with its LP band shaded.
+
+    The band is drawn per-snapshot, so an active world that re-centres shows a
+    band that tracks the price; a passive band is flat. Full-range is omitted
+    (the band would span the whole axis).
+    """
     sub = snapshots.filter(pl.col("world") == world.name).sort("ts")
     times = _timestamps(sub["ts"])
     prices = _price_series(sub, world)
 
     fig = go.Figure()
+
+    has_band = world.kind != "full_range" and "band_low_usdc" in sub.columns
+    if has_band:
+        lows = sub["band_low_usdc"].to_list()
+        highs = sub["band_high_usdc"].to_list()
+        # Filled band between low/high edges, as a step (band holds until the
+        # next rebalance), so re-centres read as discrete jumps.
+        fig.add_trace(
+            go.Scatter(
+                x=times, y=highs, mode="lines", line=dict(width=0, shape="hv"),
+                showlegend=False, hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=times, y=lows, mode="lines", line=dict(width=0, shape="hv"),
+                fill="tonexty", fillcolor="rgba(22,163,74,0.15)",
+                name="LP band", hoverinfo="skip",
+            )
+        )
+
     fig.add_trace(
         go.Scatter(
             x=times, y=prices, mode="lines", name="pool price",
@@ -50,30 +76,14 @@ def liquidity_figure(snapshots: pl.DataFrame, world: WorldResult) -> go.Figure:
         )
     )
 
-    # Shade the active LP band, unless full-range (band would span the axis).
-    if world.sqrt_a_x96 and world.sqrt_b_x96 and world.kind != "full_range":
-        edges = sorted(
-            volatile_price_in_usdc(
-                s, decimals0=world.decimals0, decimals1=world.decimals1,
-                usdc_is_token0=world.usdc_is_currency0,
-            )
-            for s in (world.sqrt_a_x96, world.sqrt_b_x96)
-        )
-        band_low, band_high = edges
-        # Clip the shaded band to a sensible view around the price path.
-        if prices:
-            lo = min(min(prices), band_low) * 0.98
-            hi = max(max(prices), band_high) * 1.02
-            fig.update_yaxes(range=[lo, hi])
-        fig.add_hrect(
-            y0=band_low, y1=band_high, fillcolor="#16a34a", opacity=0.12,
-            line_width=0, annotation_text="LP range", annotation_position="top left",
-        )
-        fig.add_hline(y=band_low, line_dash="dash", line_color="#16a34a", line_width=1)
-        fig.add_hline(y=band_high, line_dash="dash", line_color="#16a34a", line_width=1)
+    if has_band and prices:
+        lo = min(min(prices), min(lows)) * 0.98
+        hi = max(max(prices), max(highs)) * 1.02
+        fig.update_yaxes(range=[lo, hi])
 
+    rebal = f" ({world.rebalances} rebalances)" if world.rebalances else ""
     fig.update_layout(
-        title=f"Liquidity placement vs price — {world.name}",
+        title=f"Liquidity placement vs price — {world.name}{rebal}",
         xaxis_title="time (UTC)",
         yaxis_title="price (USDC per volatile token)",
         template="plotly_white",

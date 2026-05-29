@@ -29,23 +29,16 @@ from v4sim.evm.arb import arb_to_target
 from v4sim.evm.artifacts import creation_code
 from v4sim.evm.env import V4Env, bootstrap_v4_eth_usdc
 from v4sim.evm.hookmine import deploy_hook
-from v4sim.evm.pool import ZERO_ADDRESS, PoolKey, initialize, modify_liquidity, read_slot0, swap
+from v4sim.evm.pool import ZERO_ADDRESS, PoolKey, initialize, read_slot0, swap
 from v4sim.evm.state import uncollected_fees_raw
-from v4sim.evm.tickmath import get_sqrt_price_at_tick
 from v4sim.metrics.accounting import (
     amounts_for_liquidity,
-    liquidity_for_amounts,
-    price_token1_in_token0,
     usdc_value_of_position,
+    volatile_price_in_usdc,
 )
 from v4sim.metrics.gas import DEFAULT_GAS_MODEL, GasModel
-from v4sim.strategies.concentrated import band_ticks
-from v4sim.strategies.full_range import (
-    MAX_SQRT_PRICE_X96,
-    MIN_SQRT_PRICE_X96,
-    usable_tick_range,
-)
-from v4sim.strategies.hook_adapter import PASSIVE_ADAPTER, HookAdapter
+from v4sim.strategies.hook_adapter import HookAdapter, PositionState
+from v4sim.strategies.placement import place_position
 
 log = logging.getLogger(__name__)
 
@@ -89,15 +82,12 @@ class _World:
     spec: WorldSpec
     env: V4Env
     key: PoolKey
-    sqrt_a_x96: int
-    sqrt_b_x96: int
-    tick_lower: int
-    tick_upper: int
-    liquidity: int
+    position: PositionState
     usdc_is_currency0: bool
     hook_addr: str = ZERO_ADDRESS
     adapter: HookAdapter | None = None
     cum_arb: float = 0.0
+    cum_realized_fees: float = 0.0
     arbs: int = 0
     executed: int = 0
     skipped: int = 0
@@ -191,68 +181,46 @@ def _value_position(
     )
 
 
-def _split_50_50_amounts(
-    env: V4Env, init_sqrt_x96: int, lp_notional_usdc: float, *, usdc_is_currency0: bool
-) -> tuple[int, int]:
-    """Raw (amount0, amount1) for a 50/50-by-USDC-value deposit at init price."""
-    half = lp_notional_usdc / 2.0
-    p_raw = price_token1_in_token0(init_sqrt_x96)
-    price_t1_per_t0_human = p_raw * (10 ** (env.decimals0 - env.decimals1))
-    if usdc_is_currency0:
-        amount0_raw = int(half * 10**env.decimals0)
-        amount1_raw = int(half * price_t1_per_t0_human * 10**env.decimals1)
-    else:
-        amount1_raw = int(half * 10**env.decimals1)
-        amount0_raw = int(half / price_t1_per_t0_human * 10**env.decimals0)
-    return amount0_raw, amount1_raw
-
-
-def _rescale_to_notional(
-    env: V4Env,
-    liquidity: int,
-    sqrt_p_x96: int,
-    sqrt_a_x96: int,
-    sqrt_b_x96: int,
-    target_usdc: float,
-    *,
-    usdc_is_currency0: bool,
-) -> int:
-    """Scale liquidity so the position's value at init price == target_usdc.
-
-    Position value is linear in L, so one rescale is exact. Keeps every world
-    at the same notional regardless of band width — fair baseline comparison.
-    """
-    amt0, amt1 = amounts_for_liquidity(sqrt_p_x96, sqrt_a_x96, sqrt_b_x96, liquidity)
-    value = _value_position(env, amt0, amt1, sqrt_p_x96, usdc_is_currency0=usdc_is_currency0)
-    if value <= 0:
-        raise ValueError(f"position value non-positive ({value})")
-    return int(liquidity * target_usdc / value)
-
-
 def _world_fees_raw(world: _World, current_tick: int) -> tuple[int, int]:
     """Uncollected (token0, token1) fees for this world's LP position, raw units."""
+    pos = world.position
     return uncollected_fees_raw(
         world.env,
         world.key,
         owner=world.env.modify_liquidity_router,
-        tick_lower=world.tick_lower,
-        tick_upper=world.tick_upper,
+        tick_lower=pos.tick_lower,
+        tick_upper=pos.tick_upper,
         current_tick=current_tick,
+        salt=pos.salt,
     )
 
 
 def _snapshot_world(world: _World, ts: int, swap_index: int) -> dict:
     slot0 = read_slot0(world.env, world.key)
+    pos = world.position
     amt0, amt1 = amounts_for_liquidity(
-        slot0.sqrt_price_x96, world.sqrt_a_x96, world.sqrt_b_x96, world.liquidity
+        slot0.sqrt_price_x96, pos.sqrt_a_x96, pos.sqrt_b_x96, pos.liquidity
     )
     value = _value_position(
         world.env, amt0, amt1, slot0.sqrt_price_x96, usdc_is_currency0=world.usdc_is_currency0
     )
     fees0, fees1 = _world_fees_raw(world, slot0.tick)
-    fees_usdc = _value_position(
+    # Total fees to date = fees already realized at rebalances + still-uncollected.
+    uncollected_usdc = _value_position(
         world.env, fees0, fees1, slot0.sqrt_price_x96, usdc_is_currency0=world.usdc_is_currency0
     )
+    fees_usdc = world.cum_realized_fees + uncollected_usdc
+    # Current band edges in price terms, so the liquidity chart can track a
+    # moving band (active worlds re-centre; passive bands are flat).
+    edge_a = volatile_price_in_usdc(
+        pos.sqrt_a_x96, decimals0=world.env.decimals0, decimals1=world.env.decimals1,
+        usdc_is_token0=world.usdc_is_currency0,
+    )
+    edge_b = volatile_price_in_usdc(
+        pos.sqrt_b_x96, decimals0=world.env.decimals0, decimals1=world.env.decimals1,
+        usdc_is_token0=world.usdc_is_currency0,
+    )
+    band_low, band_high = sorted((edge_a, edge_b))
     return {
         "ts": ts,
         "world": world.spec.name,
@@ -267,6 +235,9 @@ def _snapshot_world(world: _World, ts: int, swap_index: int) -> dict:
         "fees_usdc": fees_usdc,
         "lp_value_plus_fees_usdc": value + fees_usdc,
         "cum_arb_extracted_usdc": world.cum_arb,
+        "band_low_usdc": band_low,
+        "band_high_usdc": band_high,
+        "rebalances": world.rebalances,
     }
 
 
@@ -345,11 +316,13 @@ def replay_worlds(
 
             # Tick keeper: let an active hook rebalance at the (post-arb) truth
             # price. Passive worlds have no adapter; the no-op adapter returns
-            # False. The call site is here so real hooks plug in unchanged.
+            # None. The call site is here so real hooks plug in unchanged.
             if w.adapter is not None:
                 keeper_price = truth_sp if truth_sp is not None else read_slot0(w.env, w.key).sqrt_price_x96
-                if w.adapter.rebalance(w.env, w.key, keeper_price):
+                rb = w.adapter.rebalance(w.env, w.key, w.position, keeper_price)
+                if rb is not None:
                     w.rebalances += 1
+                    w.cum_realized_fees += rb.realized_fees_usdc
 
         ts = int(row["ts"])
         if ts - last_snap_ts >= snapshot_period_s:
@@ -392,10 +365,10 @@ def replay_worlds(
             decimals0=w.env.decimals0,
             decimals1=w.env.decimals1,
             usdc_is_currency0=w.usdc_is_currency0,
-            tick_lower=w.tick_lower,
-            tick_upper=w.tick_upper,
-            sqrt_a_x96=w.sqrt_a_x96,
-            sqrt_b_x96=w.sqrt_b_x96,
+            tick_lower=w.position.tick_lower,
+            tick_upper=w.position.tick_upper,
+            sqrt_a_x96=w.position.sqrt_a_x96,
+            sqrt_b_x96=w.position.sqrt_b_x96,
         )
     return WorldsResult(snapshots=snap_df, worlds=results)
 
@@ -403,12 +376,14 @@ def replay_worlds(
 def _build_world(
     spec: WorldSpec, env: V4Env, init_sqrt_x96: int, lp_notional_usdc: float
 ) -> _World:
-    """Build a world, rescaling liquidity so its value == lp_notional_usdc.
+    """Build a world, sizing liquidity so its value == lp_notional_usdc.
 
     Placement is governed by `band_pct` for every kind (None = full-range).
     `kind == "hook"` first deploys the hook at a flag-valid address and
     attaches it to the pool; the no-op test hook leaves mechanics unchanged so
-    its world tracks the matching vanilla baseline.
+    its world tracks the matching vanilla baseline. A `spec.adapter` (active
+    rebalancer) may be attached to any kind — its `rebalance` runs on the tick
+    keeper; passive worlds leave it None.
     """
     if spec.kind not in ("full_range", "concentrated", "hook"):
         raise ValueError(f"unknown world kind {spec.kind!r}")
@@ -416,7 +391,6 @@ def _build_world(
     usdc_is_currency0 = env.decimals0 == 6
 
     hook_addr = ZERO_ADDRESS
-    adapter: HookAdapter | None = None
     if spec.kind == "hook":
         if spec.hook_artifact is None:
             raise ValueError("hook world requires hook_artifact")
@@ -426,7 +400,6 @@ def _build_world(
             spec.hook_flags,
             constructor_args=spec.hook_constructor_args,
         )
-        adapter = spec.adapter or PASSIVE_ADAPTER
 
     key = PoolKey(
         currency0=env.currency0,
@@ -436,38 +409,21 @@ def _build_world(
         hooks=hook_addr,
     )
     init_tick = initialize(env, key, init_sqrt_x96)
-    amount0_raw, amount1_raw = _split_50_50_amounts(
-        env, init_sqrt_x96, lp_notional_usdc, usdc_is_currency0=usdc_is_currency0
+    position = place_position(
+        env, key,
+        center_tick=init_tick, center_sqrt_x96=init_sqrt_x96,
+        tick_spacing=spec.tick_spacing, band_pct=spec.band_pct,
+        target_usdc=lp_notional_usdc, usdc_is_currency0=usdc_is_currency0,
     )
-
-    # LP placement by band: None -> full range, else a ±band_pct position.
-    if spec.band_pct is None:
-        sqrt_a, sqrt_b = MIN_SQRT_PRICE_X96, MAX_SQRT_PRICE_X96
-        lower, upper = usable_tick_range(spec.tick_spacing)
-    else:
-        lower, upper = band_ticks(init_tick, spec.tick_spacing, spec.band_pct)
-        sqrt_a = get_sqrt_price_at_tick(lower)
-        sqrt_b = get_sqrt_price_at_tick(upper)
-
-    liquidity = liquidity_for_amounts(init_sqrt_x96, sqrt_a, sqrt_b, amount0_raw, amount1_raw)
-    liquidity = _rescale_to_notional(
-        env, liquidity, init_sqrt_x96, sqrt_a, sqrt_b, lp_notional_usdc,
-        usdc_is_currency0=usdc_is_currency0,
-    )
-    modify_liquidity(env, key, tick_lower=lower, tick_upper=upper, liquidity_delta=liquidity)
 
     return _World(
         spec=spec,
         env=env,
         key=key,
-        sqrt_a_x96=sqrt_a,
-        sqrt_b_x96=sqrt_b,
-        tick_lower=lower,
-        tick_upper=upper,
-        liquidity=liquidity,
+        position=position,
         usdc_is_currency0=usdc_is_currency0,
         hook_addr=hook_addr,
-        adapter=adapter,
+        adapter=spec.adapter,
     )
 
 
@@ -511,6 +467,32 @@ def default_baseline_specs(band_pct: float = DEFAULT_BAND_PCT) -> list[WorldSpec
         WorldSpec(name="full_range", kind="full_range"),
         WorldSpec(name="concentrated", kind="concentrated", band_pct=band_pct),
     ]
+
+
+def active_recenter_spec(
+    name: str = "active_recenter",
+    *,
+    band_pct: float = DEFAULT_BAND_PCT,
+    recenter_pct: float = 0.05,
+    tick_spacing: int = DEFAULT_TICK_SPACING,
+) -> WorldSpec:
+    """A concentrated world driven by the auto-recentering active adapter.
+
+    Demonstrates the active path end-to-end: the harness places the initial
+    ±band_pct position, then the adapter re-centres it whenever price drifts
+    `recenter_pct` from the band centre (booking realized fees and gas).
+    """
+    from v4sim.strategies.active_rebalance import AutoRecenterAdapter
+
+    return WorldSpec(
+        name=name,
+        kind="concentrated",
+        band_pct=band_pct,
+        tick_spacing=tick_spacing,
+        adapter=AutoRecenterAdapter(
+            band_pct=band_pct, recenter_pct=recenter_pct, tick_spacing=tick_spacing
+        ),
+    )
 
 
 def noop_hook_spec(name: str = "hook", band_pct: float = DEFAULT_BAND_PCT) -> WorldSpec:
@@ -609,6 +591,14 @@ def cli(argv: list[str] | None = None) -> int:
         "--demo-hook", action="store_true",
         help="add a transparent no-op hook world (v4-core MockHooks) for plumbing demos",
     )
+    parser.add_argument(
+        "--active", action="store_true",
+        help="add an auto-recentering active world (re-centres the band on price drift)",
+    )
+    parser.add_argument(
+        "--recenter-pct", type=float, default=0.05,
+        help="active world: re-centre when price drifts this fraction from band centre",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -632,6 +622,8 @@ def cli(argv: list[str] | None = None) -> int:
     )
 
     specs = default_baseline_specs(band_pct=args.band_pct)
+    if args.active:
+        specs.append(active_recenter_spec(band_pct=args.band_pct, recenter_pct=args.recenter_pct))
     if args.demo_hook:
         specs.append(noop_hook_spec(band_pct=args.band_pct))
     if args.hook is not None:

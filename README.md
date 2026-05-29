@@ -40,6 +40,7 @@ Built step-by-step as a vertical slice. Current step:
 - [x] **Step 5** — Concentrated ±10% baseline as a second parallel world; multi-world replay engine
 - [x] **Step 6** — Generic hook world: CREATE2 HookMiner, load any hook from a forge artifact JSON, adapter seam + tick-keeper call site
 - [x] **Step 7** — Fee attribution + visual report + Streamlit UI: LP fee tracking from pool storage, HODL-baseline decomposition, self-contained `report.html`, and a guided paste-a-hook web app
+- [x] **Step 8** — Active rebalancing end-to-end: a shared mutable `PositionState`, an auto-recentering adapter that withdraws + re-places liquidity on price drift, gas firing per rebalance, and a moving-band liquidity chart
 
 ### Where this is going
 
@@ -121,7 +122,7 @@ v4-hook-LP-returns-sim/
 │   │   └── schema.py          # swap record polars schema
 │   ├── evm/                   # pyrevm wiring (step 2+); state.py = fee-growth reads
 │   ├── replay/                # swap-by-swap runner (step 3+)
-│   ├── strategies/            # full_range, concentrated, hook_adapter
+│   ├── strategies/            # full_range, concentrated, hook_adapter, active_rebalance, placement
 │   ├── metrics/               # LP value, fees, IL, gas, attribution
 │   ├── viz/                   # equity, attribution, liquidity, report (HTML)
 │   ├── app/                   # Streamlit UI (step 7b)
@@ -290,6 +291,35 @@ v4sim-report --days 2 --out data/cache/report.html          # baselines only
 v4sim-report --days 2 --demo-hook                           # + transparent hook
 v4sim-report --hook out/MyHook.sol/MyHook.json --hook-flags 0x40
 ```
+
+### Active rebalancing (step 8)
+
+The tick-keeper seam from step 6 is now live. An *active* adapter overrides
+`HookAdapter.rebalance(env, key, position, truth_price)` to actually move
+liquidity; the runner shares a mutable `PositionState` with it (single source
+of truth for "where is this world's liquidity now"), books the fees it
+realizes, and charges gas per rebalance via the step-7 gas model.
+
+The bundled example, `AutoRecenterAdapter`
+(`strategies/active_rebalance.py`), re-centres a ±`band_pct` position whenever
+price drifts `recenter_pct` from the band centre: it reads and realizes the
+position's fees, withdraws it, and re-places the *same value* in a fresh band
+around the current price (value-conserving, so only gas is a cost). Placement
+math is shared with the runner's initial build (`strategies/placement.py`).
+
+```bash
+v4sim-replay --active --recenter-pct 0.02      # add an active world to the run
+v4sim-report --days 3 --active --recenter-pct 0.02
+```
+
+This makes the LP tradeoff legible: re-centred liquidity stays near the price
+so it **earns more fees** and bleeds **less to arbitrage**, but it **realizes
+IL** at each re-centre (selling the falling asset, buying the rising one) and
+**pays gas**. The decomposition and the moving-band liquidity chart show all
+four moving at once. A real hook with the same intent subclasses `HookAdapter`
+identically and calls its own `rebalance()` instead of the harness's
+`modify_liquidity`. With a large `recenter_pct` (never triggers) the active
+world collapses exactly onto the passive concentrated baseline.
 
 ### Streamlit app (step 7b)
 

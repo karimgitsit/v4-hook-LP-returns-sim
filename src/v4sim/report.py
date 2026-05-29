@@ -21,6 +21,7 @@ from v4sim.replay.runner import (
     WorldSpec,
     _apply_window,
     _parse_when,
+    active_recenter_spec,
     default_baseline_specs,
     noop_hook_spec,
     replay_worlds,
@@ -52,6 +53,14 @@ def cli(argv: list[str] | None = None) -> int:
     parser.add_argument("--lp-notional-usdc", type=float, default=1_000_000.0)
     parser.add_argument("--no-arb", action="store_true", help="disable arb-to-truth (drift mode)")
     parser.add_argument("--demo-hook", action="store_true", help="add a no-op MockHooks world")
+    parser.add_argument(
+        "--active", action="store_true",
+        help="add an auto-recentering active world (re-centres the band on drift)",
+    )
+    parser.add_argument(
+        "--recenter-pct", type=float, default=0.05,
+        help="active world: re-centre when price drifts this fraction from band centre",
+    )
     parser.add_argument("--hook", type=Path, default=None, help="forge artifact JSON for a hook world")
     parser.add_argument(
         "--hook-flags", type=lambda s: int(s, 0), default=None, help="hook permission flag bits"
@@ -75,6 +84,8 @@ def cli(argv: list[str] | None = None) -> int:
         parser.error(f"after windowing, fewer than 2 rows remain ({df.height})")
 
     specs = default_baseline_specs(band_pct=args.band_pct)
+    if args.active:
+        specs.append(active_recenter_spec(band_pct=args.band_pct, recenter_pct=args.recenter_pct))
     if args.demo_hook:
         specs.append(noop_hook_spec(band_pct=args.band_pct))
     if args.hook is not None:

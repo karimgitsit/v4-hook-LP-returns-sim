@@ -28,8 +28,8 @@ def test_adapter_loader_accepts_hookadapter_subclass():
     src = (
         b"from v4sim.strategies.hook_adapter import HookAdapter\n"
         b"class Adapter(HookAdapter):\n"
-        b"    def rebalance(self, env, key, p):\n"
-        b"        return False\n"
+        b"    def rebalance(self, env, key, position, truth_sqrt_price_x96):\n"
+        b"        return None\n"
     )
     adapter = streamlit_app.load_adapter_from_bytes(src, "my_adapter.py")
     assert isinstance(adapter, HookAdapter)

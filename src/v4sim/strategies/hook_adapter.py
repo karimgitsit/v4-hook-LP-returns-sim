@@ -12,16 +12,48 @@ different verbs (e.g. directional-liquidity's depositRight / depositLeft /
 depositBoth) ships a ~30-line subclass under ``adapters/<hookname>.py`` that
 maps its ABI onto these methods.
 
-Step 6 wires only the passive (no-op) adapter, which is what the transparent
-test hook uses — its position is placed by the harness like a vanilla LP and
-it never rebalances. The active deposit/withdraw paths fill in once a real
-hook (directional-liquidity) exists.
+The passive (no-op) adapter places its position like a vanilla LP and never
+rebalances. An *active* adapter (see ``strategies.active_rebalance``) overrides
+:meth:`HookAdapter.rebalance` to move liquidity — withdrawing and re-placing
+the position — and reports the fees it realized so the runner can book them.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from v4sim.evm.env import V4Env
 from v4sim.evm.pool import PoolKey
+
+
+@dataclass
+class PositionState:
+    """A single LP position the runner snapshots and an adapter may mutate.
+
+    Holds both the tick range and its sqrt-price bounds (cached so the
+    off-chain value/fee math never recomputes them). An active adapter mutates
+    this *in place* when it rebalances; the runner reads it for every snapshot,
+    so there is one source of truth for "where is this world's liquidity now".
+    """
+
+    tick_lower: int
+    tick_upper: int
+    sqrt_a_x96: int
+    sqrt_b_x96: int
+    liquidity: int
+    salt: bytes = field(default=b"\x00" * 32)
+
+
+@dataclass(frozen=True)
+class RebalanceResult:
+    """What an adapter did on one tick-keeper call.
+
+    ``realized_fees_usdc`` is the USDC value of fees the adapter collected (and
+    removed from the position) during the rebalance — the runner accumulates it
+    so total fees = realized + still-uncollected.
+    """
+
+    realized_fees_usdc: float = 0.0
 
 
 class HookAdapter:
@@ -31,15 +63,18 @@ class HookAdapter:
     #: rather than letting the harness place a vanilla position.
     manages_own_liquidity: bool = False
 
-    def rebalance(self, env: V4Env, key: PoolKey, truth_sqrt_price_x96: int) -> bool:
-        """Tick keeper. Called after each swap+arb at the truth price.
+    def rebalance(
+        self, env: V4Env, key: PoolKey, position: PositionState, truth_sqrt_price_x96: int
+    ) -> RebalanceResult | None:
+        """Tick keeper. Called after each swap+arb at the (post-arb) truth price.
 
-        Return True if a rebalance was performed. The base implementation is a
-        no-op (passive LP), so the transparent test hook leaves pool mechanics
-        unchanged. An active hook adapter overrides this to call the hook's
-        ``rebalance()`` when it is profitable net of the configured gas.
+        Return a :class:`RebalanceResult` if a rebalance was performed (the
+        runner counts it and books any realized fees), or ``None`` for a no-op.
+        The base implementation is passive, so the transparent test hook leaves
+        pool mechanics unchanged. An active adapter overrides this to mutate
+        ``position`` and move liquidity when it is worthwhile net of gas.
         """
-        return False
+        return None
 
 
 # Singleton-ish default used when a hook world has no custom adapter.

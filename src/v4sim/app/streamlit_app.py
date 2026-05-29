@@ -30,6 +30,7 @@ from v4sim.metrics.gas import GasModel
 from v4sim.replay.runner import (
     DEFAULT_BAND_PCT,
     WorldSpec,
+    active_recenter_spec,
     default_baseline_specs,
     noop_hook_spec,
     replay_worlds,
@@ -198,8 +199,30 @@ def _adapter_section() -> HookAdapter | None:
     return None
 
 
-def _build_specs(cfg: dict, hook: dict, adapter: HookAdapter | None) -> list[WorldSpec]:
+def _active_section() -> dict:
+    with st.expander("2b · Auto-recentering active world (no hook needed)"):
+        st.markdown(
+            "Add a built-in **active** strategy that re-centres a concentrated "
+            "band on the price as it drifts — collecting fees and paying gas at "
+            "each move. A ready-made example of the active `rebalance()` seam, "
+            "useful as a comparison point for your hook."
+        )
+        enabled = st.checkbox("Add an auto-recentering active world")
+        recenter_pct = st.slider(
+            "Re-centre when price drifts (±%)", min_value=0.5, max_value=20.0, value=5.0,
+            step=0.5, disabled=not enabled,
+        ) / 100.0
+    return {"enabled": enabled, "recenter_pct": recenter_pct}
+
+
+def _build_specs(
+    cfg: dict, hook: dict, adapter: HookAdapter | None, active: dict
+) -> list[WorldSpec]:
     specs = default_baseline_specs(band_pct=cfg["band_pct"])
+    if active["enabled"]:
+        specs.append(
+            active_recenter_spec(band_pct=cfg["band_pct"], recenter_pct=active["recenter_pct"])
+        )
     if hook["mode"] == "Demo no-op hook (MockHooks)":
         specs.append(noop_hook_spec(band_pct=cfg["band_pct"]))
     elif hook["mode"] == "Upload a forge artifact" and hook["artifact"] is not None:
@@ -291,6 +314,7 @@ def main() -> None:
 
     hook = _hook_section()
     adapter = _adapter_section()
+    active = _active_section()
 
     st.subheader("3 · Date window")
     # Default to the last day for a fast first run.
@@ -313,7 +337,7 @@ def main() -> None:
         if df.height < 2:
             st.error("Need at least 2 swaps in the window — widen the date range.")
             st.stop()
-        specs = _build_specs(cfg, hook, adapter)
+        specs = _build_specs(cfg, hook, adapter, active)
         try:
             with st.spinner(f"Replaying {df.height:,} swaps across {len(specs)} worlds…"):
                 result = replay_worlds(
