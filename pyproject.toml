@@ -33,11 +33,15 @@ dev = [
     "ruff>=0.4",
     "ipykernel>=6.29",
 ]
+ui = [
+    "streamlit>=1.36",
+]
 
 [project.scripts]
 v4sim-pull-swaps = "v4sim.data.subgraph:cli"
 v4sim-replay = "v4sim.replay.runner:cli"
 v4sim-report = "v4sim.report:cli"
+v4sim-app = "v4sim.app_launcher:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]

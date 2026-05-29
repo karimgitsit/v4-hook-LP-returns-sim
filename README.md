@@ -39,7 +39,7 @@ Built step-by-step as a vertical slice. Current step:
 - [x] **Step 4** — Arb-to-truth: pool tracks v3 √P within 1 tick after each swap; arb PnL booked as value extracted from LPs
 - [x] **Step 5** — Concentrated ±10% baseline as a second parallel world; multi-world replay engine
 - [x] **Step 6** — Generic hook world: CREATE2 HookMiner, load any hook from a forge artifact JSON, adapter seam + tick-keeper call site
-- [ ] Step 7 — Visual report + Streamlit UI (3-line equity, attribution, liquidity placement; paste-a-hook flow)
+- [x] **Step 7** — Fee attribution + visual report + Streamlit UI: LP fee tracking from pool storage, HODL-baseline decomposition, self-contained `report.html`, and a guided paste-a-hook web app
 
 ### Where this is going
 
@@ -119,11 +119,13 @@ v4-hook-LP-returns-sim/
 │   ├── data/
 │   │   ├── subgraph.py        # paginated GraphQL → Parquet cache
 │   │   └── schema.py          # swap record polars schema
-│   ├── evm/                   # pyrevm wiring (step 2+)
+│   ├── evm/                   # pyrevm wiring (step 2+); state.py = fee-growth reads
 │   ├── replay/                # swap-by-swap runner (step 3+)
 │   ├── strategies/            # full_range, concentrated, hook_adapter
-│   ├── metrics/               # LP value, fees, IL, gas, arb extracted
-│   └── viz/                   # equity, attribution, liquidity
+│   ├── metrics/               # LP value, fees, IL, gas, attribution
+│   ├── viz/                   # equity, attribution, liquidity, report (HTML)
+│   ├── app/                   # Streamlit UI (step 7b)
+│   └── report.py              # v4sim-report CLI
 ├── adapters/                  # hook-specific harness adapters
 ├── configs/
 │   └── eth_usdc_5bps_2024.yaml
@@ -253,4 +255,53 @@ liquidity. Same-size swaps move our small pool ~100× more, and the arb
 captures the full impact each time. A week-long run on the 5bps ETH/USDC
 parquet currently shows ~$200M cumulative extraction (i.e. catastrophic
 LVR) on a stable $1M LP equity — exactly the LVR-vs-fees story you'd
-expect when your LP is undersized for the swap volume.
+expect when your LP is undersized for the swap volume. Fee income (step 7)
+is inflated by the same factor, so read the **relative** comparison between
+worlds — not the absolute dollars — as the signal.
+
+### Fee attribution + report (step 7a)
+
+LP fee income is read straight from PoolManager storage — a Python port of
+v4-core's `StateLibrary` (`evm/state.py`) that computes `feeGrowthInside`
+from the global accumulator and the boundary ticks' `feeGrowthOutside`, then
+`fees = liquidity * (insideNow − insideLast) >> 128`. No state perturbation,
+and it agrees to the wei with a `modifyLiquidity(0)` poke.
+
+Each world is decomposed against a **HODL baseline** at the final price
+(`metrics/attribution.py`):
+
+- **HODL** — the initial deposit basket marked at the final price
+- **LP underlying** — the position's token0/token1 at the final price (no fees)
+- **IL** = LP underlying − HODL (signed; negative under impermanent loss)
+- **Fees** — uncollected LP fees, valued at the final price
+- **Gas** — modelled rebalance cost (`metrics/gas.py`: gwei × gas × ETH price
+  per rebalance; passive worlds pay $0)
+- **LVR** — `cum_arb_extracted_usdc`, reported alongside
+
+with **net LP PnL = IL + fees − gas** as the headline (LVR shown separately as
+the value bled to arbitrage — the ceiling an LVR-capturing hook could reclaim).
+
+`v4sim-report` runs the replay and writes a single self-contained
+`report.html` (plotly.js inlined, opens offline) with equity / fee / liquidity
+charts and a summary table:
+
+```bash
+v4sim-report --days 2 --out data/cache/report.html          # baselines only
+v4sim-report --days 2 --demo-hook                           # + transparent hook
+v4sim-report --hook out/MyHook.sol/MyHook.json --hook-flags 0x40
+```
+
+### Streamlit app (step 7b)
+
+A guided web UI wraps the runner + report. Install the `ui` extra and launch:
+
+```bash
+pip install -e ".[ui]"
+v4sim-app            # == streamlit run src/v4sim/app/streamlit_app.py
+```
+
+The app walks you through `forge build` → upload `out/MyHook.json`, ticking
+the permission flags your hook declares; pick a date window over the cached
+parquet (defaults to the last day for a fast run — a full week is ~25s);
+optionally upload a `HookAdapter` subclass for non-standard verbs; then **Run**
+to see the same charts inline plus a downloadable `report.html`.
