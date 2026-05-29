@@ -30,6 +30,7 @@ from v4sim.evm.artifacts import creation_code
 from v4sim.evm.env import V4Env, bootstrap_v4_eth_usdc
 from v4sim.evm.hookmine import deploy_hook
 from v4sim.evm.pool import ZERO_ADDRESS, PoolKey, initialize, modify_liquidity, read_slot0, swap
+from v4sim.evm.state import uncollected_fees_raw
 from v4sim.evm.tickmath import get_sqrt_price_at_tick
 from v4sim.metrics.accounting import (
     amounts_for_liquidity,
@@ -37,6 +38,7 @@ from v4sim.metrics.accounting import (
     price_token1_in_token0,
     usdc_value_of_position,
 )
+from v4sim.metrics.gas import DEFAULT_GAS_MODEL, GasModel
 from v4sim.strategies.concentrated import band_ticks
 from v4sim.strategies.full_range import (
     MAX_SQRT_PRICE_X96,
@@ -89,6 +91,8 @@ class _World:
     key: PoolKey
     sqrt_a_x96: int
     sqrt_b_x96: int
+    tick_lower: int
+    tick_upper: int
     liquidity: int
     usdc_is_currency0: bool
     hook_addr: str = ZERO_ADDRESS
@@ -114,6 +118,21 @@ class WorldResult:
     arbs_executed: int
     rebalances: int = 0
     hook_addr: str = ZERO_ADDRESS
+    # Attribution inputs (step 7a).
+    initial_lp_amount0_raw: int = 0
+    initial_lp_amount1_raw: int = 0
+    final_sqrt_price_x96: int = 0
+    fees_token0_raw: int = 0
+    fees_token1_raw: int = 0
+    fees_usdc: float = 0.0
+    gas_usdc: float = 0.0
+    decimals0: int = 18
+    decimals1: int = 18
+    usdc_is_currency0: bool = True
+    tick_lower: int = 0
+    tick_upper: int = 0
+    sqrt_a_x96: int = 0
+    sqrt_b_x96: int = 0
 
 
 @dataclass
@@ -210,6 +229,18 @@ def _rescale_to_notional(
     return int(liquidity * target_usdc / value)
 
 
+def _world_fees_raw(world: _World, current_tick: int) -> tuple[int, int]:
+    """Uncollected (token0, token1) fees for this world's LP position, raw units."""
+    return uncollected_fees_raw(
+        world.env,
+        world.key,
+        owner=world.env.modify_liquidity_router,
+        tick_lower=world.tick_lower,
+        tick_upper=world.tick_upper,
+        current_tick=current_tick,
+    )
+
+
 def _snapshot_world(world: _World, ts: int, swap_index: int) -> dict:
     slot0 = read_slot0(world.env, world.key)
     amt0, amt1 = amounts_for_liquidity(
@@ -217,6 +248,10 @@ def _snapshot_world(world: _World, ts: int, swap_index: int) -> dict:
     )
     value = _value_position(
         world.env, amt0, amt1, slot0.sqrt_price_x96, usdc_is_currency0=world.usdc_is_currency0
+    )
+    fees0, fees1 = _world_fees_raw(world, slot0.tick)
+    fees_usdc = _value_position(
+        world.env, fees0, fees1, slot0.sqrt_price_x96, usdc_is_currency0=world.usdc_is_currency0
     )
     return {
         "ts": ts,
@@ -227,6 +262,10 @@ def _snapshot_world(world: _World, ts: int, swap_index: int) -> dict:
         "lp_amount0_raw": str(amt0),
         "lp_amount1_raw": str(amt1),
         "lp_value_usdc": value,
+        "fees_token0_raw": str(fees0),
+        "fees_token1_raw": str(fees1),
+        "fees_usdc": fees_usdc,
+        "lp_value_plus_fees_usdc": value + fees_usdc,
         "cum_arb_extracted_usdc": world.cum_arb,
     }
 
@@ -239,6 +278,7 @@ def replay_worlds(
     snapshot_period_s: int = DEFAULT_SNAPSHOT_PERIOD_S,
     arb_to_truth: bool = True,
     envs: dict[str, V4Env] | None = None,
+    gas_model: GasModel = DEFAULT_GAS_MODEL,
 ) -> WorldsResult:
     """Replay `swaps_df` against every world in `specs`.
 
@@ -266,6 +306,10 @@ def replay_worlds(
     first_ts = int(rows[0]["ts"])
     snap_rows: list[dict] = [_snapshot_world(w, first_ts, 0) for w in worlds]
     initial_values = {w.spec.name: snap_rows[i]["lp_value_usdc"] for i, w in enumerate(worlds)}
+    initial_amounts = {
+        w.spec.name: (int(snap_rows[i]["lp_amount0_raw"]), int(snap_rows[i]["lp_amount1_raw"]))
+        for i, w in enumerate(worlds)
+    }
     last_snap_ts = first_ts
 
     for idx, row in enumerate(rows[1:], start=1):
@@ -324,6 +368,7 @@ def replay_worlds(
     for w in worlds:
         wrows = snap_df.filter(pl.col("world") == w.spec.name)
         final = wrows.tail(1).to_dicts()[0]
+        init0, init1 = initial_amounts[w.spec.name]
         results[w.spec.name] = WorldResult(
             name=w.spec.name,
             kind=w.spec.kind,
@@ -337,6 +382,20 @@ def replay_worlds(
             arbs_executed=w.arbs,
             rebalances=w.rebalances,
             hook_addr=w.hook_addr,
+            initial_lp_amount0_raw=init0,
+            initial_lp_amount1_raw=init1,
+            final_sqrt_price_x96=int(final["sqrt_price_x96"]),
+            fees_token0_raw=int(final["fees_token0_raw"]),
+            fees_token1_raw=int(final["fees_token1_raw"]),
+            fees_usdc=final["fees_usdc"],
+            gas_usdc=gas_model.cost_usdc(w.rebalances),
+            decimals0=w.env.decimals0,
+            decimals1=w.env.decimals1,
+            usdc_is_currency0=w.usdc_is_currency0,
+            tick_lower=w.tick_lower,
+            tick_upper=w.tick_upper,
+            sqrt_a_x96=w.sqrt_a_x96,
+            sqrt_b_x96=w.sqrt_b_x96,
         )
     return WorldsResult(snapshots=snap_df, worlds=results)
 
@@ -403,6 +462,8 @@ def _build_world(
         key=key,
         sqrt_a_x96=sqrt_a,
         sqrt_b_x96=sqrt_b,
+        tick_lower=lower,
+        tick_upper=upper,
         liquidity=liquidity,
         usdc_is_currency0=usdc_is_currency0,
         hook_addr=hook_addr,

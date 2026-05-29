@@ -87,6 +87,19 @@ def price_token1_in_token0(sqrt_p_x96: int) -> float:
     return (sqrt_p_x96 / (1 << 96)) ** 2
 
 
+def volatile_price_in_usdc(
+    sqrt_p_x96: int, *, decimals0: int, decimals1: int, usdc_is_token0: bool
+) -> float:
+    """Price of the volatile asset in USDC (e.g. USDC per ETH) at ``sqrt_p_x96``."""
+    p_raw = price_token1_in_token0(sqrt_p_x96)
+    price_t1_per_t0_human = p_raw * (10 ** (decimals0 - decimals1))
+    if usdc_is_token0:
+        # token1 is the volatile asset; price_t1_per_t0_human = volatile per USDC.
+        return 1.0 / price_t1_per_t0_human if price_t1_per_t0_human else 0.0
+    # token0 is the volatile asset; price_t1_per_t0_human = USDC per volatile.
+    return price_t1_per_t0_human
+
+
 def usdc_value_of_position(
     amount0_raw: int,
     amount1_raw: int,

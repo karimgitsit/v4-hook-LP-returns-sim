@@ -37,6 +37,7 @@ dev = [
 [project.scripts]
 v4sim-pull-swaps = "v4sim.data.subgraph:cli"
 v4sim-replay = "v4sim.replay.runner:cli"
+v4sim-report = "v4sim.report:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
