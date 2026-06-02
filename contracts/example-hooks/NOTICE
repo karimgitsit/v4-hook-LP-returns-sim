@@ -1,0 +1,37 @@
+Vendored third-party hook sources
+=================================
+
+This directory vendors a real, published Uniswap v4 hook so the simulator can
+run it end-to-end against the vanilla baselines. Sources are copied verbatim
+(MIT-licensed) and credited below.
+
+1. OpenZeppelin Uniswap Hooks
+   Repository: https://github.com/OpenZeppelin/uniswap-hooks
+   Pinned commit: 26dc8e53f812a1ca390d470342adb6cd8c3286ad (master, 2026-05-15).
+   The individual files carry their own "last updated vX.Y.Z" headers. License: MIT.
+
+   Files (under src/, paths preserved so internal relative imports resolve):
+     - src/general/AntiSandwichHook.sol     (verbatim)
+     - src/fee/BaseDynamicAfterFee.sol      (verbatim)
+     - src/base/BaseHook.sol                (verbatim)
+     - src/utils/CurrencySettler.sol        (verbatim)
+     - src/interfaces/IHookEvents.sol       (verbatim)
+     - src/general/ReHypothecationHook.sol  (verbatim)
+
+   src/AntiSandwichHookHarness.sol is OpenZeppelin's canonical deployable
+   `AntiSandwichMock` (src/mocks/general/AntiSandwichMock.sol), renamed and with
+   the coverage-only `test()` stub removed. Economic behaviour is unchanged.
+
+   src/ReHypothecationERC4626Harness.sol is OpenZeppelin's
+   `ReHypothecationERC4626Mock` (src/mocks/general/), with import depth adjusted
+   and the coverage-only `test()` stub removed; it also contains OZ's
+   `ERC4626YieldSourceMock`. Economic behaviour is unchanged.
+
+2. OpenZeppelin Contracts (dependencies of the hooks: ERC20, ERC4626, SafeERC20,
+   TransientSlot, ReentrancyGuardTransient, Math, …)
+   Repository: https://github.com/OpenZeppelin/openzeppelin-contracts
+   License: MIT.
+
+   Provided as the git submodule `oz/`, pinned to commit
+   fcbae5394ae8ad52d8e580a3477db99814b9d565 — the exact commit the uniswap-hooks
+   repo pins. (`@openzeppelin/contracts/` remaps to `oz/contracts/`.)

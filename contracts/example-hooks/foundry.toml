@@ -1,0 +1,23 @@
+# Foundry project for vendored third-party example hooks (e.g. AntiSandwichHook).
+#
+# Built by scripts/build_contracts.sh AFTER contracts/v4-core, so the hook is
+# compiled against the SAME v4-core source the harness deploys — guaranteeing
+# the hook's calls match our PoolManager's interface. evm_version = cancun is
+# required: BaseDynamicAfterFee uses transient storage (TSTORE/TLOAD).
+[profile.default]
+src = "src"
+out = "out"
+# OZ contracts come from the `oz/` submodule, pinned to the commit uniswap-hooks
+# uses (so ERC4626 etc. resolve). `oz/` (not `lib/`) dodges the .gitignore rule.
+libs = ["oz"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = false
+# Use ONLY remappings.txt — the oz/ submodule ships its own remappings.txt that
+# forge would otherwise merge and double the @openzeppelin/contracts path.
+auto_detect_remappings = false
+# The @uniswap/v4-core remapping points at the sibling submodule (../v4-core),
+# which is outside this project root; allow solc to read it.
+allow_paths = ["../v4-core"]
