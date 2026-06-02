@@ -58,6 +58,10 @@ def cli(argv: list[str] | None = None) -> int:
         help="add the real vendored OpenZeppelin AntiSandwichHook world (full-range)",
     )
     parser.add_argument(
+        "--oracle-guard", action="store_true",
+        help="add the example OracleGuardHook world (Tier-1 seam: reads a mock Chainlink feed)",
+    )
+    parser.add_argument(
         "--active", action="store_true",
         help="add an auto-recentering active world (re-centres the band on drift)",
     )
@@ -96,6 +100,10 @@ def cli(argv: list[str] | None = None) -> int:
         from v4sim.replay.runner import antisandwich_hook_spec
 
         specs.append(antisandwich_hook_spec())
+    if args.oracle_guard:
+        from v4sim.replay.runner import oracle_guard_hook_spec
+
+        specs.append(oracle_guard_hook_spec())
     if args.hook is not None:
         if args.hook_flags is None:
             parser.error("--hook requires --hook-flags")

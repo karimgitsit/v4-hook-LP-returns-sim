@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -79,6 +80,15 @@ class WorldSpec:
     # address isn't known when the spec is declared; set this and the runner
     # ABI-encodes env.manager and prepends it to `hook_constructor_args`.
     hook_ctor_manager: bool = False
+    # Tier-1 mock-injection seam, for hooks that call EXTERNAL contracts at
+    # runtime (oracles, Chainlink feeds, ERC-4626 vaults, …). `env_setup` runs
+    # after the env is bootstrapped and before the hook deploys; it deploys/funds
+    # whatever the hook needs and returns a {name: address} map. `hook_ctor_args_fn`
+    # then builds the hook's ABI-encoded ctor args from (env, that map) — use it
+    # when the hook's constructor must reference a mock's address. When set it
+    # supersedes `hook_ctor_manager`/`hook_constructor_args`.
+    env_setup: Callable[[V4Env], dict[str, str]] | None = None
+    hook_ctor_args_fn: Callable[[V4Env, dict[str, str]], bytes] | None = None
     adapter: HookAdapter | None = None  # None -> passive (no rebalance)
 
 
@@ -91,6 +101,7 @@ class _World:
     usdc_is_currency0: bool
     hook_addr: str = ZERO_ADDRESS
     adapter: HookAdapter | None = None
+    mocks: dict[str, str] = field(default_factory=dict)
     cum_arb: float = 0.0
     cum_realized_fees: float = 0.0
     arbs: int = 0
@@ -402,14 +413,22 @@ def _build_world(
     usdc_is_currency0 = env.decimals0 == 6
 
     hook_addr = ZERO_ADDRESS
+    mocks: dict[str, str] = {}
     if spec.kind == "hook":
         if spec.hook_artifact is None:
             raise ValueError("hook world requires hook_artifact")
-        ctor_args = spec.hook_constructor_args
-        if spec.hook_ctor_manager:
-            from eth_abi import encode as abi_encode
+        # Tier-1: deploy any external dependencies (oracles, vaults, …) the hook
+        # calls at runtime, before the hook itself exists.
+        if spec.env_setup is not None:
+            mocks = spec.env_setup(env) or {}
+        if spec.hook_ctor_args_fn is not None:
+            ctor_args = spec.hook_ctor_args_fn(env, mocks)
+        else:
+            ctor_args = spec.hook_constructor_args
+            if spec.hook_ctor_manager:
+                from eth_abi import encode as abi_encode
 
-            ctor_args = abi_encode(["address"], [env.manager]) + ctor_args
+                ctor_args = abi_encode(["address"], [env.manager]) + ctor_args
         hook_addr = deploy_hook(
             env,
             creation_code(spec.hook_artifact),
@@ -440,6 +459,7 @@ def _build_world(
         usdc_is_currency0=usdc_is_currency0,
         hook_addr=hook_addr,
         adapter=spec.adapter,
+        mocks=mocks,
     )
 
 
@@ -570,6 +590,62 @@ def antisandwich_hook_spec(name: str = "antisandwich", band_pct: float | None = 
     )
 
 
+def oracle_guard_hook_spec(
+    name: str = "oracle_guard",
+    *,
+    band_pct: float | None = None,
+    oracle_price_usd: float = 2500.0,
+    floor_usd: float = 1.0,
+    feed_decimals: int = 8,
+) -> WorldSpec:
+    """A world running the example `OracleGuardHook`, which reads an EXTERNAL
+    Chainlink-style price feed on every swap and pauses trading while the price
+    sits below ``floor_usd`` (a depeg / crash circuit breaker).
+
+    This is the worked example for the Tier-1 mock-injection seam: `env_setup`
+    deploys a `MockV3Aggregator` into the world's env, and `hook_ctor_args_fn`
+    wires that feed's address (plus the PoolManager and the floor) into the
+    hook's constructor. With the defaults (price $2500 ≫ floor $1) the breaker
+    never trips, so the hook runs end-to-end and — being beforeSwap-only with a
+    zero delta — tracks the vanilla baseline; raise ``floor_usd`` above
+    ``oracle_price_usd`` to watch it gate every swap.
+
+    Requires the example-hook artifacts (run scripts/build_contracts.sh).
+    """
+    from eth_abi import encode as abi_encode
+
+    from v4sim.evm.artifacts import creation_code, load_artifact_file
+    from v4sim.evm.env import DEFAULT_GAS_LIMIT
+    from v4sim.evm.hookmine import BEFORE_SWAP_FLAG
+
+    hook_art = load_artifact_file(_HOOKS_OUT / "OracleGuardHook.sol" / "OracleGuardHook.json")
+    mock_art = load_artifact_file(_HOOKS_OUT / "MockV3Aggregator.sol" / "MockV3Aggregator.json")
+    answer = int(round(oracle_price_usd * 10**feed_decimals))
+    floor = int(round(floor_usd * 10**feed_decimals))
+
+    def env_setup(env: V4Env) -> dict[str, str]:
+        code = creation_code(mock_art) + abi_encode(["uint8", "int256"], [feed_decimals, answer])
+        feed = env.evm.deploy(env.deployer, code, gas=DEFAULT_GAS_LIMIT)
+        if not feed:
+            raise RuntimeError("mock oracle deploy returned empty address")
+        return {"feed": feed}
+
+    def ctor_args(env: V4Env, mocks: dict[str, str]) -> bytes:
+        return abi_encode(
+            ["address", "address", "int256"], [env.manager, mocks["feed"], floor]
+        )
+
+    return WorldSpec(
+        name=name,
+        kind="hook",
+        band_pct=band_pct,
+        hook_artifact=hook_art,
+        hook_flags=BEFORE_SWAP_FLAG,
+        env_setup=env_setup,
+        hook_ctor_args_fn=ctor_args,
+    )
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -651,6 +727,10 @@ def cli(argv: list[str] | None = None) -> int:
         help="add a world running the real vendored OpenZeppelin AntiSandwichHook (full-range)",
     )
     parser.add_argument(
+        "--oracle-guard", action="store_true",
+        help="add the example OracleGuardHook world (Tier-1 seam: reads a mock Chainlink feed)",
+    )
+    parser.add_argument(
         "--active", action="store_true",
         help="add an auto-recentering active world (re-centres the band on price drift)",
     )
@@ -687,6 +767,8 @@ def cli(argv: list[str] | None = None) -> int:
         specs.append(noop_hook_spec(band_pct=args.band_pct))
     if args.antisandwich:
         specs.append(antisandwich_hook_spec())
+    if args.oracle_guard:
+        specs.append(oracle_guard_hook_spec())
     if args.hook is not None:
         if args.hook_flags is None:
             parser.error("--hook requires --hook-flags")

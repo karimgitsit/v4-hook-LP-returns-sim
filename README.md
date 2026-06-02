@@ -377,6 +377,38 @@ LP fees.
 > in-block price move to it. The hook's *direction* (kills LVR, returns it to
 > LPs) is faithful; the absolute dollars are not a forecast.
 
+### Hooks with external dependencies (Tier-1 mock-injection seam)
+
+Many real hooks call *other* contracts at runtime — a price oracle, a Chainlink
+feed, an ERC-4626 vault. The harness only deploys a PoolManager + two mock
+ERC20s + routers, so such a hook would revert unless its dependencies exist in
+the sandbox. Two `WorldSpec` fields close that gap:
+
+- **`env_setup(env) -> {name: address}`** runs after the env is bootstrapped and
+  before the hook deploys. Deploy/fund whatever the hook needs and return the
+  addresses.
+- **`hook_ctor_args_fn(env, mocks) -> bytes`** builds the hook's ABI-encoded
+  constructor args from the env and those mock addresses — so the hook is
+  constructed pointing at the freshly deployed mocks.
+
+The worked example is `OracleGuardHook` (`contracts/example-hooks/`), a depeg
+circuit breaker that reads a Chainlink-style feed every swap and pauses trading
+when the price falls below a floor. `oracle_guard_hook_spec()` deploys a
+`MockV3Aggregator` via `env_setup` and wires it in via `hook_ctor_args_fn`:
+
+```bash
+v4sim-replay --oracle-guard         # add the oracle-consuming hook world
+v4sim-report --days 2 --oracle-guard
+```
+
+With the default price ($2500) above the floor ($1) the breaker is off and the
+hook is transparent (tracks the full-range baseline); raise the floor above the
+price and it gates every swap. Tests assert all three: the seam deploys the
+feed, the hook reads it (tripping pauses swaps), and *without* the seam the hook
+reverts — proving the dependency is genuinely exercised. This is the general
+path for any hook with runtime dependencies; you supply the mocks your hook
+expects.
+
 ### Streamlit app (step 7b)
 
 A guided web UI wraps the runner + report. Install the `ui` extra and launch:
