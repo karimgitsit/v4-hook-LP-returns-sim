@@ -32,3 +32,13 @@ FOUNDRY_PROFILE=debug FOUNDRY_DISABLE_NIGHTLY_WARNING=1 \
     forge build --skip test --skip script "${EXTRA_ARGS[@]}"
 
 echo "OK — artifacts in contracts/v4-core/out/"
+
+# Build the vendored third-party example hooks (e.g. AntiSandwichHook) AFTER
+# v4-core, so they compile against the exact v4-core source the harness deploys.
+# Their artifacts are loaded via the runner's --hook path (out/<Hook>.sol/<Hook>.json).
+if [[ -d "$REPO_ROOT/contracts/hooks" ]]; then
+    cd "$REPO_ROOT/contracts/hooks"
+    FOUNDRY_DISABLE_NIGHTLY_WARNING=1 \
+        forge build "${EXTRA_ARGS[@]}"
+    echo "OK — hook artifacts in contracts/hooks/out/"
+fi

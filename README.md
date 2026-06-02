@@ -41,6 +41,7 @@ Built step-by-step as a vertical slice. Current step:
 - [x] **Step 6** — Generic hook world: CREATE2 HookMiner, load any hook from a forge artifact JSON, adapter seam + tick-keeper call site
 - [x] **Step 7** — Fee attribution + visual report + Streamlit UI: LP fee tracking from pool storage, HODL-baseline decomposition, self-contained `report.html`, and a guided paste-a-hook web app
 - [x] **Step 8** — Active rebalancing end-to-end: a shared mutable `PositionState`, an auto-recentering adapter that withdraws + re-places liquidity on price drift, gas firing per rebalance, and a moving-band liquidity chart
+- [x] **Step 9** — A *real published* hook plugged in end-to-end: OpenZeppelin's `AntiSandwichHook`, vendored and compiled against our v4-core, deployed at a mined flag-valid address, run as a world against the baselines — plus per-swap block-number advancement so the hook's per-block slot window is real
 
 ### Where this is going
 
@@ -320,6 +321,57 @@ four moving at once. A real hook with the same intent subclasses `HookAdapter`
 identically and calls its own `rebalance()` instead of the harness's
 `modify_liquidity`. With a large `recenter_pct` (never triggers) the active
 world collapses exactly onto the passive concentrated baseline.
+
+### Real published hook: AntiSandwichHook (step 9)
+
+Steps 1–8 build the machine; step 9 proves it on a real, third-party hook —
+OpenZeppelin's audited [`AntiSandwichHook`](https://github.com/OpenZeppelin/uniswap-hooks)
+(the umbra-research sandwich-resistant AMM design). It is **vendored verbatim**
+under `contracts/hooks/` (see `contracts/hooks/NOTICE` for provenance + MIT
+attribution) and compiled by `scripts/build_contracts.sh` *against our own
+v4-core submodule*, so the deployed bytecode matches the PoolManager the harness
+runs. No code in the hook is modified; we only add a thin deployable wrapper
+(`AntiSandwichHookHarness.sol`, OpenZeppelin's own `AntiSandwichMock` renamed).
+
+```bash
+v4sim-replay --antisandwich --limit 3000     # add the real hook as a world
+v4sim-report --days 2 --antisandwich         # full report incl. the hook
+```
+
+What the hook does: for `!zeroForOne` swaps it pins execution to the
+beginning-of-block price (so a back-run can't profit from an in-block price
+move) and **donates the surplus to in-range LPs**. The world is placed
+**full-range** so the sole simulated LP is always in range to receive those
+donations (otherwise `donate` reverts with `NoLiquidityToReceiveDonation`).
+
+Two integration pieces made this work, both reusable by any future hook:
+
+1. **Block-number advancement.** The replay now sets each world's
+   `block.number`/`timestamp` from the swap's real on-chain block
+   (`V4Env.set_block`). Block-aware hooks (anti-sandwich, JIT penalties, TWAP)
+   are no-ops without it; with it, the user swap and its back-running arb share
+   a block exactly as they did on-chain. Harmless for hookless worlds.
+2. **Constructor manager injection.** Any `BaseHook` takes the PoolManager as
+   its first ctor arg, but that address is only known once the per-world env is
+   bootstrapped. `WorldSpec(hook_ctor_manager=True)` makes the runner
+   ABI-encode `env.manager` and prepend it to the hook's constructor args.
+
+The result needs **no new attribution line**: the hook's benefit flows straight
+through the existing metrics. Donations raise the LP's fee growth (the **Fees**
+line jumps), and constrained arbs extract far less (**LVR** collapses, even
+going negative — arbing becomes unprofitable, exactly as OZ's docs warn). On a
+3 000-swap window the anti-sandwich world's LVR fell from **+$9.7M**
+(full-range baseline) to **−$0.8M**, with the recaptured value reappearing as
+LP fees.
+
+> ⚠️ **Read this as a relative result.** The magnitude is inflated by two
+> things stacked together: the [undersized pool](#why-is-cum_arb_extracted_usdc-so-large)
+> (already makes LVR/fees huge), and the modelling choice that the back-running
+> arb shares the price-moving swap's block. In reality a front-run is small and
+> the arb captures only a sliver; here the arb tries to undo the *entire* user
+> swap within the same block, so the anti-sandwich rule attributes the full
+> in-block price move to it. The hook's *direction* (kills LVR, returns it to
+> LPs) is faithful; the absolute dollars are not a forecast.
 
 ### Streamlit app (step 7b)
 

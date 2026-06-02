@@ -54,6 +54,10 @@ def cli(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-arb", action="store_true", help="disable arb-to-truth (drift mode)")
     parser.add_argument("--demo-hook", action="store_true", help="add a no-op MockHooks world")
     parser.add_argument(
+        "--antisandwich", action="store_true",
+        help="add the real vendored OpenZeppelin AntiSandwichHook world (full-range)",
+    )
+    parser.add_argument(
         "--active", action="store_true",
         help="add an auto-recentering active world (re-centres the band on drift)",
     )
@@ -88,6 +92,10 @@ def cli(argv: list[str] | None = None) -> int:
         specs.append(active_recenter_spec(band_pct=args.band_pct, recenter_pct=args.recenter_pct))
     if args.demo_hook:
         specs.append(noop_hook_spec(band_pct=args.band_pct))
+    if args.antisandwich:
+        from v4sim.replay.runner import antisandwich_hook_spec
+
+        specs.append(antisandwich_hook_spec())
     if args.hook is not None:
         if args.hook_flags is None:
             parser.error("--hook requires --hook-flags")

@@ -1,0 +1,20 @@
+# Foundry project for vendored third-party example hooks (e.g. AntiSandwichHook).
+#
+# Built by scripts/build_contracts.sh AFTER contracts/v4-core, so the hook is
+# compiled against the SAME v4-core source the harness deploys — guaranteeing
+# the hook's calls match our PoolManager's interface. evm_version = cancun is
+# required: BaseDynamicAfterFee uses transient storage (TSTORE/TLOAD).
+[profile.default]
+src = "src"
+out = "out"
+# Vendored OZ-contracts deps live in vendor/ (not lib/, which the repo's
+# .gitignore excludes) so they're committed and available on a fresh container.
+libs = ["vendor"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = false
+# The @uniswap/v4-core remapping points at the sibling submodule (../v4-core),
+# which is outside this project root; allow solc to read it.
+allow_paths = ["../v4-core"]

@@ -1,0 +1,40 @@
+Vendored third-party hook sources
+=================================
+
+This directory vendors a real, published Uniswap v4 hook so the simulator can
+run it end-to-end against the vanilla baselines. Sources are copied verbatim
+(MIT-licensed) and credited below.
+
+1. OpenZeppelin Uniswap Hooks
+   Repository: https://github.com/OpenZeppelin/uniswap-hooks
+   Pinned commit: 26dc8e53f812a1ca390d470342adb6cd8c3286ad (master, 2026-05-15).
+   The individual files carry their own "last updated vX.Y.Z" headers. License: MIT.
+
+   Files (under src/, paths preserved so internal relative imports resolve):
+     - src/general/AntiSandwichHook.sol   (verbatim)
+     - src/fee/BaseDynamicAfterFee.sol    (verbatim)
+     - src/base/BaseHook.sol              (verbatim)
+     - src/utils/CurrencySettler.sol      (verbatim)
+     - src/interfaces/IHookEvents.sol     (verbatim)
+
+   src/AntiSandwichHookHarness.sol is OpenZeppelin's canonical deployable
+   `AntiSandwichMock` (src/mocks/general/AntiSandwichMock.sol), renamed and with
+   the coverage-only `test()` stub removed. Economic behaviour is unchanged.
+
+2. OpenZeppelin Contracts (transitive dependencies of the hook)
+   Repository: https://github.com/OpenZeppelin/openzeppelin-contracts
+   License: MIT.
+
+   Files (under vendor/openzeppelin-contracts/contracts/, paths preserved):
+     - utils/math/SafeCast.sol                (OZ contracts 5.0.2)
+     - utils/Address.sol                      (OZ contracts 5.0.2)
+     - token/ERC20/IERC20.sol                 (OZ contracts 5.0.2)
+     - token/ERC20/extensions/IERC20Permit.sol(OZ contracts 5.0.2)
+     - token/ERC20/utils/SafeERC20.sol        (OZ contracts 5.0.2)
+     - utils/TransientSlot.sol                (OZ contracts, pinned commit
+                                               fcbae5394ae8ad52d8e580a3477db99814b9d565)
+     - utils/SlotDerivation.sol               (same pinned commit)
+
+   TransientSlot / SlotDerivation are taken from the exact OZ-contracts commit
+   the uniswap-hooks repo pins, because they were added after the 5.0.2 bundled
+   with v4-core. Both are self-contained (no further imports).

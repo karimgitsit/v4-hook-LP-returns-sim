@@ -74,6 +74,11 @@ class WorldSpec:
     hook_artifact: dict | None = None  # forge artifact JSON (parsed)
     hook_flags: int = 0  # required v4 permission bits (low 14 of the address)
     hook_constructor_args: bytes = b""  # ABI-encoded ctor args
+    # Many hooks (anything extending a BaseHook) take the PoolManager as their
+    # first constructor arg. The manager is deployed fresh per world, so its
+    # address isn't known when the spec is declared; set this and the runner
+    # ABI-encodes env.manager and prepends it to `hook_constructor_args`.
+    hook_ctor_manager: bool = False
     adapter: HookAdapter | None = None  # None -> passive (no rebalance)
 
 
@@ -287,7 +292,13 @@ def replay_worlds(
         source_dir = int(row["dir"])
         amount_in = float(row["amount_in"])
         truth_sp = _parse_sqrt_price(row["sqrt_price_x96_post"]) if arb_to_truth else None
+        block_number = int(row["block"])
+        block_ts = int(row["ts"])
         for w in worlds:
+            # Advance each world's block to the swap's real on-chain block so the
+            # user swap and its arb back-run share a block (as they did on-chain),
+            # which is what lets block-aware hooks act. No-op for hookless worlds.
+            w.env.set_block(number=block_number, timestamp=block_ts)
             z4o = _harness_zero_for_one(source_dir, w.usdc_is_currency0)
             input_decimals = w.env.decimals0 if z4o else w.env.decimals1
             amount_in_raw = int(amount_in * 10**input_decimals)
@@ -394,11 +405,16 @@ def _build_world(
     if spec.kind == "hook":
         if spec.hook_artifact is None:
             raise ValueError("hook world requires hook_artifact")
+        ctor_args = spec.hook_constructor_args
+        if spec.hook_ctor_manager:
+            from eth_abi import encode as abi_encode
+
+            ctor_args = abi_encode(["address"], [env.manager]) + ctor_args
         hook_addr = deploy_hook(
             env,
             creation_code(spec.hook_artifact),
             spec.hook_flags,
-            constructor_args=spec.hook_constructor_args,
+            constructor_args=ctor_args,
         )
 
     key = PoolKey(
@@ -515,6 +531,45 @@ def noop_hook_spec(name: str = "hook", band_pct: float = DEFAULT_BAND_PCT) -> Wo
     )
 
 
+# Path to the vendored example-hook artifacts (built by scripts/build_contracts.sh).
+_HOOKS_OUT = Path(__file__).resolve().parents[3] / "contracts" / "hooks" / "out"
+
+
+def antisandwich_hook_spec(name: str = "antisandwich", band_pct: float | None = None) -> WorldSpec:
+    """A world running OpenZeppelin's real AntiSandwichHook (vendored, see contracts/hooks/).
+
+    The hook pins a beginning-of-block execution price for !zeroForOne swaps and
+    donates the resulting surplus back to in-range LPs. In this single-LP replay
+    that means value the arbitrageur would extract (LVR) is instead returned to
+    the LP as fee growth — so the hook's effect shows up directly in the existing
+    fees and LVR metrics, with no attribution change needed.
+
+    Defaults to FULL-RANGE placement (``band_pct=None``): the hook donates to
+    in-range liquidity, so a position that is always in range avoids the
+    ``NoLiquidityToReceiveDonation`` revert and gives a clean comparison against
+    the full-range baseline.
+
+    Requires block-number advancement (the runner does this per swap) and the
+    artifact built at contracts/hooks/out/ — run scripts/build_contracts.sh.
+    """
+    from v4sim.evm.artifacts import load_artifact_file
+    from v4sim.evm.hookmine import (
+        AFTER_SWAP_FLAG,
+        AFTER_SWAP_RETURNS_DELTA_FLAG,
+        BEFORE_SWAP_FLAG,
+    )
+
+    artifact_path = _HOOKS_OUT / "AntiSandwichHookHarness.sol" / "AntiSandwichHookHarness.json"
+    return WorldSpec(
+        name=name,
+        kind="hook",
+        band_pct=band_pct,
+        hook_artifact=load_artifact_file(artifact_path),
+        hook_flags=BEFORE_SWAP_FLAG | AFTER_SWAP_FLAG | AFTER_SWAP_RETURNS_DELTA_FLAG,
+        hook_ctor_manager=True,
+    )
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -592,6 +647,10 @@ def cli(argv: list[str] | None = None) -> int:
         help="add a transparent no-op hook world (v4-core MockHooks) for plumbing demos",
     )
     parser.add_argument(
+        "--antisandwich", action="store_true",
+        help="add a world running the real vendored OpenZeppelin AntiSandwichHook (full-range)",
+    )
+    parser.add_argument(
         "--active", action="store_true",
         help="add an auto-recentering active world (re-centres the band on price drift)",
     )
@@ -626,6 +685,8 @@ def cli(argv: list[str] | None = None) -> int:
         specs.append(active_recenter_spec(band_pct=args.band_pct, recenter_pct=args.recenter_pct))
     if args.demo_hook:
         specs.append(noop_hook_spec(band_pct=args.band_pct))
+    if args.antisandwich:
+        specs.append(antisandwich_hook_spec())
     if args.hook is not None:
         if args.hook_flags is None:
             parser.error("--hook requires --hook-flags")

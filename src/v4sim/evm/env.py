@@ -21,7 +21,14 @@ from .artifacts import bytecode
 
 DEPLOYER = "0x000000000000000000000000000000000000abcd"
 INITIAL_TOKEN_SUPPLY = 2**200  # plenty; sortable as uint256
-DEFAULT_GAS_LIMIT = 30_000_000
+# Per-call EVM execution cap. This is a simulation guard against runaway loops,
+# NOT an economic gas parameter — rebalance/operating gas is modelled separately
+# by metrics.gas.GasModel. It is set well above a mainnet block (30M) because
+# some real hooks do unbounded per-block work: e.g. AntiSandwichHook checkpoints
+# every tick between the last and current tick on the first swap of each block,
+# which is ~20k cold SLOADs (~55M gas) for an ETH/USDC pool initialised near
+# tick 200k. 600M covers that one-time cost with ample headroom.
+DEFAULT_GAS_LIMIT = 600_000_000
 
 
 @dataclass
@@ -45,6 +52,22 @@ class V4Env:
             gas=DEFAULT_GAS_LIMIT,
         )
         return result if isinstance(result, (bytes, bytearray)) else bytes(result)
+
+    def set_block(self, *, number: int, timestamp: int | None = None) -> None:
+        """Advance the EVM's `block.number` (and optionally `block.timestamp`).
+
+        Block-aware hooks (e.g. AntiSandwichHook, which checkpoints per block to
+        pin a beginning-of-block price) read `block.number`; without advancing it
+        every swap looks like the same block and the mechanism degenerates. The
+        replay sets this from each swap's real on-chain block so swaps that shared
+        a block on-chain share one here too. Harmless for hookless worlds.
+        """
+        from pyrevm import BlockEnv
+
+        kwargs: dict = {"number": int(number)}
+        if timestamp is not None:
+            kwargs["timestamp"] = int(timestamp)
+        self.evm.set_block_env(BlockEnv(**kwargs))
 
 
 def _selector(signature: str) -> bytes:
