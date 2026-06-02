@@ -38,6 +38,11 @@ echo "OK — artifacts in contracts/v4-core/out/"
 # These are demonstration/test fixtures, not part of the core tool — the core is
 # hook-agnostic and loads any hook via the runner's --hook path.
 if [[ -d "$REPO_ROOT/contracts/example-hooks" ]]; then
+    # The ReHypothecation example needs OpenZeppelin Contracts (ERC4626, …) from
+    # the pinned oz/ submodule; make sure it's checked out.
+    if [[ ! -f "$REPO_ROOT/contracts/example-hooks/oz/contracts/token/ERC20/extensions/ERC4626.sol" ]]; then
+        git -C "$REPO_ROOT" submodule update --init contracts/example-hooks/oz
+    fi
     cd "$REPO_ROOT/contracts/example-hooks"
     FOUNDRY_DISABLE_NIGHTLY_WARNING=1 \
         forge build "${EXTRA_ARGS[@]}"

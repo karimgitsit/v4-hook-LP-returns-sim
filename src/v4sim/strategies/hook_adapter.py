@@ -60,8 +60,51 @@ class HookAdapter:
     """Default adapter: passive. Subclass and override for active hooks."""
 
     #: Set on subclasses that drive deposits/rebalances through the hook itself
-    #: rather than letting the harness place a vanilla position.
+    #: rather than letting the harness place a vanilla position. When True the
+    #: runner calls :meth:`setup` instead of placing a router-owned position, and
+    #: reads the LP's value via the position principal + :meth:`extra_value_usdc`.
     manages_own_liquidity: bool = False
+
+    def setup(
+        self,
+        env: V4Env,
+        key: PoolKey,
+        *,
+        hook_addr: str,
+        target_usdc: float,
+        usdc_is_currency0: bool,
+    ) -> PositionState:
+        """Deposit the LP's notional through the hook and return its principal.
+
+        Own-liquidity hooks (``manages_own_liquidity = True``) own the position
+        themselves; the harness must not place a router position. Instead this
+        deposits ``target_usdc`` of value via the hook's own verbs and returns a
+        :class:`PositionState` describing the *principal* liquidity (e.g. full-range
+        with ``liquidity`` = the shares minted). The runner then uses that
+        PositionState for the standard amounts/IL math, and asks
+        :meth:`extra_value_usdc` for everything on top (fees, yield).
+
+        The base class is for vanilla/standard-liquidity hooks and never calls
+        this; it raises if invoked without an override.
+        """
+        raise NotImplementedError("setup() is only for manages_own_liquidity adapters")
+
+    def extra_value_usdc(
+        self,
+        env: V4Env,
+        key: PoolKey,
+        position: PositionState,
+        sqrt_price_x96: int,
+        *,
+        usdc_is_currency0: bool,
+    ) -> float:
+        """USDC value the LP holds *beyond* its principal (fees + any yield).
+
+        Only meaningful for own-liquidity adapters, where fees/yield are
+        commingled in the hook (so the standard uncollected-fee storage read does
+        not apply). Reported in the world's ``fees_usdc``. Default 0.
+        """
+        return 0.0
 
     def rebalance(
         self, env: V4Env, key: PoolKey, position: PositionState, truth_sqrt_price_x96: int

@@ -62,6 +62,10 @@ def cli(argv: list[str] | None = None) -> int:
         help="add the example OracleGuardHook world (Tier-1 seam: reads a mock Chainlink feed)",
     )
     parser.add_argument(
+        "--rehypothecation", action="store_true",
+        help="add the real OpenZeppelin ReHypothecationHook world (Tier-2 own-liquidity)",
+    )
+    parser.add_argument(
         "--active", action="store_true",
         help="add an auto-recentering active world (re-centres the band on drift)",
     )
@@ -104,6 +108,10 @@ def cli(argv: list[str] | None = None) -> int:
         from v4sim.replay.runner import oracle_guard_hook_spec
 
         specs.append(oracle_guard_hook_spec())
+    if args.rehypothecation:
+        from v4sim.replay.runner import rehypothecation_hook_spec
+
+        specs.append(rehypothecation_hook_spec())
     if args.hook is not None:
         if args.hook_flags is None:
             parser.error("--hook requires --hook-flags")

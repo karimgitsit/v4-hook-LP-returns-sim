@@ -220,12 +220,22 @@ def _snapshot_world(world: _World, ts: int, swap_index: int) -> dict:
     value = _value_position(
         world.env, amt0, amt1, slot0.sqrt_price_x96, usdc_is_currency0=world.usdc_is_currency0
     )
-    fees0, fees1 = _world_fees_raw(world, slot0.tick)
-    # Total fees to date = fees already realized at rebalances + still-uncollected.
-    uncollected_usdc = _value_position(
-        world.env, fees0, fees1, slot0.sqrt_price_x96, usdc_is_currency0=world.usdc_is_currency0
-    )
-    fees_usdc = world.cum_realized_fees + uncollected_usdc
+    if world.adapter is not None and world.adapter.manages_own_liquidity:
+        # Own-liquidity hook: fees/yield are commingled in the hook, not in the
+        # router position's fee storage. `amt0/amt1` above are the principal
+        # (shares treated as full-range L); the adapter reports everything on top.
+        fees0, fees1 = 0, 0
+        fees_usdc = world.cum_realized_fees + world.adapter.extra_value_usdc(
+            world.env, world.key, pos, slot0.sqrt_price_x96,
+            usdc_is_currency0=world.usdc_is_currency0,
+        )
+    else:
+        fees0, fees1 = _world_fees_raw(world, slot0.tick)
+        # Total fees to date = fees realized at rebalances + still-uncollected.
+        uncollected_usdc = _value_position(
+            world.env, fees0, fees1, slot0.sqrt_price_x96, usdc_is_currency0=world.usdc_is_currency0
+        )
+        fees_usdc = world.cum_realized_fees + uncollected_usdc
     # Current band edges in price terms, so the liquidity chart can track a
     # moving band (active worlds re-centre; passive bands are flat).
     edge_a = volatile_price_in_usdc(
@@ -444,12 +454,22 @@ def _build_world(
         hooks=hook_addr,
     )
     init_tick = initialize(env, key, init_sqrt_x96)
-    position = place_position(
-        env, key,
-        center_tick=init_tick, center_sqrt_x96=init_sqrt_x96,
-        tick_spacing=spec.tick_spacing, band_pct=spec.band_pct,
-        target_usdc=lp_notional_usdc, usdc_is_currency0=usdc_is_currency0,
-    )
+    if spec.adapter is not None and spec.adapter.manages_own_liquidity:
+        # The hook owns its liquidity: let the adapter deposit through the hook's
+        # own verbs and report the principal, instead of placing a router position.
+        position = spec.adapter.setup(
+            env, key,
+            hook_addr=hook_addr,
+            target_usdc=lp_notional_usdc,
+            usdc_is_currency0=usdc_is_currency0,
+        )
+    else:
+        position = place_position(
+            env, key,
+            center_tick=init_tick, center_sqrt_x96=init_sqrt_x96,
+            tick_spacing=spec.tick_spacing, band_pct=spec.band_pct,
+            target_usdc=lp_notional_usdc, usdc_is_currency0=usdc_is_currency0,
+        )
 
     return _World(
         spec=spec,
@@ -646,6 +666,62 @@ def oracle_guard_hook_spec(
     )
 
 
+def rehypothecation_hook_spec(name: str = "rehypothecation") -> WorldSpec:
+    """A world running OpenZeppelin's real ReHypothecationHook (Tier-2 own-liquidity).
+
+    The hook owns a single full-range position, parks the underlying in ERC-4626
+    yield sources, and JIT-injects it during swaps. This exercises every Tier-2
+    seam at once: `env_setup` deploys the two vaults, `hook_ctor_args_fn` wires
+    them into the hook's constructor, and `ReHypothecationAdapter`
+    (`manages_own_liquidity=True`) deposits the LP notional via the hook and
+    values the stake via `previewRedeem` (so fees/yield land in the fees column
+    while the principal drives the standard IL math).
+
+    Requires the example-hook artifacts (run scripts/build_contracts.sh).
+    """
+    from eth_abi import encode as abi_encode
+
+    from v4sim.evm.artifacts import creation_code, load_artifact_file
+    from v4sim.evm.env import DEFAULT_GAS_LIMIT
+    from v4sim.evm.hookmine import (
+        AFTER_SWAP_FLAG,
+        BEFORE_INITIALIZE_FLAG,
+        BEFORE_SWAP_FLAG,
+    )
+    from v4sim.strategies.rehypothecation import ReHypothecationAdapter
+
+    base = _HOOKS_OUT / "ReHypothecationERC4626Harness.sol"
+    hook_art = load_artifact_file(base / "ReHypothecationERC4626Mock.json")
+    vault_art = load_artifact_file(base / "ERC4626YieldSourceMock.json")
+    vault_code = creation_code(vault_art)
+
+    def env_setup(env: V4Env) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for slot, token in (("vault0", env.currency0), ("vault1", env.currency1)):
+            code = vault_code + abi_encode(["address"], [token])
+            addr = env.evm.deploy(env.deployer, code, gas=DEFAULT_GAS_LIMIT)
+            if not addr:
+                raise RuntimeError(f"ERC4626 vault deploy returned empty address for {slot}")
+            out[slot] = addr
+        return out
+
+    def ctor_args(env: V4Env, mocks: dict[str, str]) -> bytes:
+        return abi_encode(
+            ["address", "address", "address"], [env.manager, mocks["vault0"], mocks["vault1"]]
+        )
+
+    return WorldSpec(
+        name=name,
+        kind="hook",
+        band_pct=None,  # the hook is full-range internally
+        hook_artifact=hook_art,
+        hook_flags=BEFORE_INITIALIZE_FLAG | BEFORE_SWAP_FLAG | AFTER_SWAP_FLAG,
+        env_setup=env_setup,
+        hook_ctor_args_fn=ctor_args,
+        adapter=ReHypothecationAdapter(),
+    )
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -731,6 +807,10 @@ def cli(argv: list[str] | None = None) -> int:
         help="add the example OracleGuardHook world (Tier-1 seam: reads a mock Chainlink feed)",
     )
     parser.add_argument(
+        "--rehypothecation", action="store_true",
+        help="add the real OpenZeppelin ReHypothecationHook world (Tier-2 own-liquidity)",
+    )
+    parser.add_argument(
         "--active", action="store_true",
         help="add an auto-recentering active world (re-centres the band on price drift)",
     )
@@ -769,6 +849,8 @@ def cli(argv: list[str] | None = None) -> int:
         specs.append(antisandwich_hook_spec())
     if args.oracle_guard:
         specs.append(oracle_guard_hook_spec())
+    if args.rehypothecation:
+        specs.append(rehypothecation_hook_spec())
     if args.hook is not None:
         if args.hook_flags is None:
             parser.error("--hook requires --hook-flags")

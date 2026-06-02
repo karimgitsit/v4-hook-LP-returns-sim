@@ -409,6 +409,39 @@ reverts — proving the dependency is genuinely exercised. This is the general
 path for any hook with runtime dependencies; you supply the mocks your hook
 expects.
 
+### Hooks that own their liquidity (Tier-2 own-liquidity seam)
+
+Some hooks don't let the pool hold a normal LP position — they *own* the
+liquidity themselves (JIT, rehypothecation, custom-curve) and hand the LP a share
+token. The harness can't place or read a router position for these, so a
+`HookAdapter` subclass with `manages_own_liquidity = True` takes over two jobs:
+
+- **`setup(env, key, hook_addr, target_usdc, ...)`** — deposit the LP's notional
+  through the hook's own verbs and return the *principal* as a `PositionState`
+  (so the standard amounts/IL math still applies).
+- **`extra_value_usdc(...)`** — value everything on top of principal (collected
+  fees, yield), reported in the world's fees column.
+
+The worked example is OpenZeppelin's real `ReHypothecationHook`: the LP deposits
+via `addReHypothecatedLiquidity` and holds the hook's ERC-20 shares; the
+underlying sits in ERC-4626 vaults and is JIT-injected during swaps.
+`rehypothecation_hook_spec()` deploys the two vaults (Tier-1 `env_setup`), wires
+them into the ctor, and attaches `ReHypothecationAdapter`, which deposits via the
+hook and values the stake through `previewRedeem`:
+
+```bash
+v4sim-replay --rehypothecation
+v4sim-report --days 2 --rehypothecation
+```
+
+Because the hook `take`s its owed tokens mid-swap before the swapper settles, the
+PoolManager needs standing reserves (a limitation OZ's own docs flag); the
+adapter places a `seed_frac` full-range backstop — the co-existing pool liquidity
+the hook needs in practice — whose fees are excluded from the hook's, so it earns
+only its proportional share. The example-hook contracts build against a pinned
+OpenZeppelin Contracts submodule (`contracts/example-hooks/oz`, fetched by
+`git submodule update --init --recursive`).
+
 ### Streamlit app (step 7b)
 
 A guided web UI wraps the runner + report. Install the `ui` extra and launch:

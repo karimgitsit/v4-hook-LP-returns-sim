@@ -4,3 +4,6 @@
 [submodule "contracts/v4-periphery"]
 	path = contracts/v4-periphery
 	url = https://github.com/Uniswap/v4-periphery.git
+[submodule "contracts/example-hooks/oz"]
+	path = contracts/example-hooks/oz
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts
