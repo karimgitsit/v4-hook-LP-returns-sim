@@ -1,8 +1,8 @@
 """Step-9 gate tests: a real published hook (OpenZeppelin AntiSandwichHook).
 
-The hook is vendored under contracts/hooks/ and built to
-contracts/hooks/out/AntiSandwichHookHarness.sol/AntiSandwichHookHarness.json by
-scripts/build_contracts.sh. These tests cover:
+The hook is vendored under contracts/example-hooks/ and built to
+contracts/example-hooks/out/AntiSandwichHookHarness.sol/AntiSandwichHookHarness.json
+by scripts/build_contracts.sh. These tests cover:
 
 * the PoolManager-address constructor-arg prepend (hook_ctor_manager),
 * per-swap block-number advancement (env.set_block), which the hook needs to

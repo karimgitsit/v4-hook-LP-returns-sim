@@ -326,12 +326,16 @@ world collapses exactly onto the passive concentrated baseline.
 
 Steps 1–8 build the machine; step 9 proves it on a real, third-party hook —
 OpenZeppelin's audited [`AntiSandwichHook`](https://github.com/OpenZeppelin/uniswap-hooks)
-(the umbra-research sandwich-resistant AMM design). It is **vendored verbatim**
-under `contracts/hooks/` (see `contracts/hooks/NOTICE` for provenance + MIT
+(the umbra-research sandwich-resistant AMM design). The core simulator is
+**hook-agnostic** (any hook loads via `--hook <artifact> --hook-flags`); this hook
+is just a bundled **example**, vendored verbatim under `contracts/example-hooks/`
+(see that directory's `README.md` and `NOTICE` for the full story + MIT
 attribution) and compiled by `scripts/build_contracts.sh` *against our own
 v4-core submodule*, so the deployed bytecode matches the PoolManager the harness
 runs. No code in the hook is modified; we only add a thin deployable wrapper
 (`AntiSandwichHookHarness.sol`, OpenZeppelin's own `AntiSandwichMock` renamed).
+`--antisandwich` is a convenience preset for this example, equivalent to passing
+its artifact and flags via `--hook`.
 
 ```bash
 v4sim-replay --antisandwich --limit 3000     # add the real hook as a world

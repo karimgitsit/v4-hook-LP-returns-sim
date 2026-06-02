@@ -532,11 +532,11 @@ def noop_hook_spec(name: str = "hook", band_pct: float = DEFAULT_BAND_PCT) -> Wo
 
 
 # Path to the vendored example-hook artifacts (built by scripts/build_contracts.sh).
-_HOOKS_OUT = Path(__file__).resolve().parents[3] / "contracts" / "hooks" / "out"
+_HOOKS_OUT = Path(__file__).resolve().parents[3] / "contracts" / "example-hooks" / "out"
 
 
 def antisandwich_hook_spec(name: str = "antisandwich", band_pct: float | None = None) -> WorldSpec:
-    """A world running OpenZeppelin's real AntiSandwichHook (vendored, see contracts/hooks/).
+    """A world running OpenZeppelin's real AntiSandwichHook (vendored, see contracts/example-hooks/).
 
     The hook pins a beginning-of-block execution price for !zeroForOne swaps and
     donates the resulting surplus back to in-range LPs. In this single-LP replay
@@ -550,7 +550,7 @@ def antisandwich_hook_spec(name: str = "antisandwich", band_pct: float | None = 
     the full-range baseline.
 
     Requires block-number advancement (the runner does this per swap) and the
-    artifact built at contracts/hooks/out/ — run scripts/build_contracts.sh.
+    artifact built at contracts/example-hooks/out/ — run scripts/build_contracts.sh.
     """
     from v4sim.evm.artifacts import load_artifact_file
     from v4sim.evm.hookmine import (
